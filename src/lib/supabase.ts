@@ -1,5 +1,20 @@
 import { createClient } from '@supabase/supabase-js';
 import { env } from '../config/env.js';
+import type { QuickReplyButton as QRButton } from '../types/whatsapp-messages.js';
+
+// Re-export WhatsApp message types
+export type {
+  QuickReplyButton,
+  InteractiveMessage,
+  WhatsAppMessageType,
+  ListSection,
+  ListRow,
+  CTAButton,
+  MediaContent,
+  LocationContent,
+  CardContent,
+  MessageHeader,
+} from '../types/whatsapp-messages.js';
 
 // Cliente Supabase com Service Role Key (acesso total)
 export const supabase = createClient(
@@ -27,7 +42,7 @@ export interface MessageThread {
   agent_typing?: boolean;
   agent_typing_at?: string;
   awaiting_button_response?: boolean;
-  button_options?: QuickReplyButton[];
+  button_options?: QRButton[];
   created_at: string;
   updated_at: string;
 }
@@ -83,9 +98,4 @@ export interface AIAgent {
   name: string;
   is_enabled: boolean;
   system_prompt?: string;
-}
-
-export interface QuickReplyButton {
-  id: string;
-  title: string;
 }
