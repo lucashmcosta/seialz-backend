@@ -63,8 +63,15 @@ export async function twilioWebhookRoutes(app: FastifyInstance) {
 
       const whatsappConfig = integration.config_values as WhatsAppConfig;
 
-      // 3. Extrair número do cliente
+      // 3. Extrair números
       const customerPhone = body.From.replace('whatsapp:', '');
+      const businessPhone = body.To.replace('whatsapp:', '');
+
+      // Ignorar se o "From" for o próprio número da empresa (é uma notificação, não mensagem do cliente)
+      if (customerPhone === businessPhone || customerPhone.includes(whatsappConfig.whatsapp_number)) {
+        console.log('⚠️ Ignoring message from business number (not a customer message)');
+        return reply.status(200).send('');
+      }
 
       // 4. Encontrar ou criar contato
       const { data: existingContact } = await supabase

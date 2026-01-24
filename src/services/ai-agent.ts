@@ -78,14 +78,27 @@ export async function processAIMessage(options: ProcessMessageOptions) {
 
     // 4. Montar mensagens para o Claude
     const messages: Anthropic.MessageParam[] = (history || [])
-      .filter(m => m.content)
+      .filter(m => m.content && m.content.trim() !== '')
       .map(m => ({
         role: m.direction === 'inbound' ? 'user' as const : 'assistant' as const,
         content: m.content,
       }));
 
-    // Adicionar mensagem atual
-    messages.push({ role: 'user', content: message });
+    // Adicionar mensagem atual (se não for vazia)
+    if (message && message.trim() !== '') {
+      messages.push({ role: 'user', content: message });
+    }
+
+    // Filtrar mensagens com conteúdo vazio
+    const validMessages = messages.filter(m => {
+      const content = typeof m.content === 'string' ? m.content : '';
+      return content.trim() !== '';
+    });
+
+    if (validMessages.length === 0) {
+      console.log('⚠️ No valid messages to process (all empty)');
+      return { success: false, response: null };
+    }
 
     // 5. TODO: Implementar RAG aqui
     // const knowledge = await searchRelevantKnowledge(message, organizationId);
@@ -116,7 +129,7 @@ Use apenas quando facilitar a conversa.`;
       model: 'claude-sonnet-4-20250514',
       max_tokens: 1024,
       system: systemPrompt,
-      messages,
+      messages: validMessages,
     });
 
     const aiResponse = response.content[0].type === 'text' 
