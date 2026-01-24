@@ -84,7 +84,7 @@ export async function twilioWebhookRoutes(app: FastifyInstance) {
           .insert({
             organization_id: organizationId,
             phone: customerPhone,
-            first_name: body.ProfileName || 'WhatsApp User',
+            full_name: body.ProfileName || 'WhatsApp User',
           })
           .select('id')
           .single();
