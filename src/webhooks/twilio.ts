@@ -153,7 +153,7 @@ export async function twilioWebhookRoutes(app: FastifyInstance) {
         }
       }
 
-      // 8. Salvar mensagem
+      // 8. Salvar mensagem (whatsapp_status não é incluído para inbound - campo é para outbound)
       const { data: savedMessage, error: msgError } = await supabase
         .from('messages')
         .insert({
@@ -163,7 +163,6 @@ export async function twilioWebhookRoutes(app: FastifyInstance) {
           content: messageContent,
           sender_type: 'contact',
           whatsapp_message_sid: body.MessageSid,
-          whatsapp_status: 'received',
           media_type: mediaType,
           media_urls: mediaUrls,
           ai_processed: false,
