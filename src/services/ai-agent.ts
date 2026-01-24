@@ -30,8 +30,8 @@ export async function processAIMessage(options: ProcessMessageOptions) {
   }
 
   try {
-    // 1. Buscar configurações do agente e org
-    const [agentResult, orgResult] = await Promise.all([
+    // 1. Buscar configurações do agente e integração Claude
+    const [agentResult, claudeIntegrationResult] = await Promise.all([
       supabase
         .from('ai_agents')
         .select('*')
@@ -39,9 +39,14 @@ export async function processAIMessage(options: ProcessMessageOptions) {
         .eq('organization_id', organizationId)
         .single(),
       supabase
-        .from('organizations')
-        .select('anthropic_api_key, voyage_api_key, openai_api_key')
-        .eq('id', organizationId)
+        .from('organization_integrations')
+        .select(`
+          config_values,
+          admin_integrations!inner(slug)
+        `)
+        .eq('organization_id', organizationId)
+        .eq('admin_integrations.slug', 'claude-ai')
+        .eq('is_enabled', true)
         .single(),
     ]);
 
@@ -50,13 +55,13 @@ export async function processAIMessage(options: ProcessMessageOptions) {
     }
 
     const agent = agentResult.data;
-    const org = orgResult.data;
+    const claudeIntegration = claudeIntegrationResult.data;
 
-    // 2. Usar API key da organização ou fallback para env
-    const anthropicKey = org?.anthropic_api_key || process.env.ANTHROPIC_API_KEY;
-    
+    // 2. Usar API key da integração ou fallback para env
+    const anthropicKey = (claudeIntegration?.config_values as any)?.api_key || process.env.ANTHROPIC_API_KEY;
+
     if (!anthropicKey) {
-      throw new Error('Anthropic API key not configured');
+      throw new Error('Anthropic API key not configured for organization');
     }
 
     const anthropic = new Anthropic({ apiKey: anthropicKey });
