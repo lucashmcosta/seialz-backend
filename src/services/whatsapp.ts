@@ -89,10 +89,11 @@ export async function sendWhatsAppMessage(options: SendMessageOptions) {
     to: `whatsapp:${customerPhone}`,
   });
 
-  console.log(`📤 Message sent: ${message.sid}`);
+  console.log(`📤 Message sent to Twilio: ${message.sid}`);
 
   // 5. Salvar mensagem
-  await supabase
+  console.log(`💾 Saving outbound message...`);
+  const { data: savedMsg, error: saveError } = await supabase
     .from('messages')
     .insert({
       organization_id: organizationId,
@@ -101,10 +102,18 @@ export async function sendWhatsAppMessage(options: SendMessageOptions) {
       content: messageBody,
       sender_type: 'agent',
       whatsapp_message_sid: message.sid,
-      whatsapp_status: 'sent',
+      whatsapp_status: 'sending',
       ai_processed: true,
       metadata: buttons ? { interactive: true, buttons } : {},
-    });
+    })
+    .select('id')
+    .single();
+
+  if (saveError) {
+    console.error('❌ Error saving outbound message:', saveError);
+  } else {
+    console.log(`✅ Outbound message saved: ${savedMsg.id}`);
+  }
 
   // 6. Esconder typing
   await supabase
