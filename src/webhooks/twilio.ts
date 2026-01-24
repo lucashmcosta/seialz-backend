@@ -77,7 +77,7 @@ export async function twilioWebhookRoutes(app: FastifyInstance) {
         .from('message_threads')
         .select('id, awaiting_button_response, button_options')
         .eq('organization_id', organizationId)
-        .eq('contact_id', contact.id)
+        .eq('contact_id', contact!.id)
         .eq('channel', 'whatsapp')
         .single();
       
@@ -86,7 +86,7 @@ export async function twilioWebhookRoutes(app: FastifyInstance) {
           .from('message_threads')
           .insert({
             organization_id: organizationId,
-            contact_id: contact.id,
+            contact_id: contact!.id,
             channel: 'whatsapp',
             external_id: customerPhone,
           })
@@ -105,9 +105,9 @@ export async function twilioWebhookRoutes(app: FastifyInstance) {
       let messageContent = body.Body || '';
       
       // Verificar se é resposta de botão
-      if (thread.awaiting_button_response && thread.button_options) {
+      if (thread!.awaiting_button_response && thread!.button_options) {
         const optionNumber = parseInt(messageContent.trim());
-        const buttons = thread.button_options as { id: string; title: string }[];
+        const buttons = thread!.button_options as { id: string; title: string }[];
         
         if (optionNumber >= 1 && optionNumber <= buttons.length) {
           console.log(`🔘 Button response detected: ${optionNumber}`);
@@ -136,7 +136,7 @@ export async function twilioWebhookRoutes(app: FastifyInstance) {
         .from('messages')
         .insert({
           organization_id: organizationId,
-          thread_id: thread.id,
+          thread_id: thread!.id,
           direction: 'inbound',
           content: messageContent,
           sender_type: 'contact',
@@ -161,17 +161,17 @@ export async function twilioWebhookRoutes(app: FastifyInstance) {
           whatsapp_last_inbound_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         })
-        .eq('id', thread.id)
+        .eq('id', thread!.id)
         .eq('organization_id', organizationId);
       
       // 9. Disparar evento para Inngest (debounce de 5s)
       await inngest.send({
         name: 'whatsapp/message.received',
         data: {
-          threadId: thread.id,
+          threadId: thread!.id,
           organizationId,
           messageId: savedMessage.id,
-          contactId: contact.id,
+          contactId: contact!.id,
         },
       });
       
