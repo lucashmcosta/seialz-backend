@@ -5,6 +5,7 @@ import { serve } from 'inngest/fastify';
 import { env } from './config/env.js';
 import { inngest } from './lib/inngest.js';
 import { twilioWebhookRoutes } from './webhooks/twilio.js';
+import { whatsappRoutes } from './routes/whatsapp.js';
 import { processMessageBatch } from './inngest/functions/process-message-batch.js';
 
 // Criar servidor Fastify
@@ -14,7 +15,20 @@ const app = Fastify({
 
 // Plugins
 await app.register(cors, {
-  origin: true, // Permitir todas as origens (ajustar em produção)
+  origin: [
+    // Production Lovable apps
+    /\.lovable\.app$/,
+    /\.lovableproject\.com$/,
+    // Local development
+    'http://localhost:5173',
+    'http://localhost:3000',
+    'http://localhost:3001',
+    // Allow all in development (fallback)
+    ...(env.NODE_ENV === 'development' ? [true] : []),
+  ],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
 });
 
 await app.register(formbody); // Para parsear form-data do Twilio
@@ -41,6 +55,13 @@ app.get('/', async () => {
 
 // Twilio WhatsApp
 await twilioWebhookRoutes(app);
+
+// ===========================
+// API ROUTES
+// ===========================
+
+// WhatsApp API routes (authenticated)
+await whatsappRoutes(app);
 
 // ===========================
 // INNGEST
@@ -82,6 +103,15 @@ const start = async () => {
 ║   Webhooks:                                               ║
 ║   - Twilio: POST /webhook/twilio/whatsapp                 ║
 ║   - Status: POST /webhook/twilio/status                   ║
+║                                                           ║
+║   WhatsApp API (authenticated):                           ║
+║   - POST /api/whatsapp/send                               ║
+║   - GET  /api/whatsapp/templates                          ║
+║   - POST /api/whatsapp/templates                          ║
+║   - DELETE /api/whatsapp/templates/:id                    ║
+║   - POST /api/whatsapp/templates/sync                     ║
+║   - POST /api/whatsapp/setup                              ║
+║   - GET  /api/whatsapp/status                             ║
 ║                                                           ║
 ╚═══════════════════════════════════════════════════════════╝
     `);
