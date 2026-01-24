@@ -1,5 +1,14 @@
+// src/services/whatsapp.ts
+
 import twilio from 'twilio';
 import { supabase, type QuickReplyButton } from '../lib/supabase.js';
+
+interface WhatsAppConfig {
+  account_sid: string;
+  auth_token: string;
+  messaging_service_sid?: string;
+  whatsapp_number: string;
+}
 
 interface SendMessageOptions {
   threadId: string;
@@ -8,23 +17,16 @@ interface SendMessageOptions {
   buttons?: QuickReplyButton[];
 }
 
-/**
- * Envia mensagem pelo WhatsApp via Twilio
- */
 export async function sendWhatsAppMessage(options: SendMessageOptions) {
   const { threadId, organizationId, content, buttons } = options;
 
-  // 1. Buscar thread com org e contact (MULTI-TENANT)
+  // 1. Buscar thread e contato
   const { data: thread, error: threadError } = await supabase
     .from('message_threads')
     .select(`
-      *,
-      contacts!inner(phone),
-      organizations!inner(
-        twilio_account_sid,
-        twilio_auth_token,
-        whatsapp_phone_number
-      )
+      id,
+      contact_id,
+      contacts!inner(phone)
     `)
     .eq('id', threadId)
     .eq('organization_id', organizationId)
@@ -34,14 +36,31 @@ export async function sendWhatsAppMessage(options: SendMessageOptions) {
     throw new Error(`Thread not found: ${threadId}`);
   }
 
-  const org = thread.organizations as any;
   const customerPhone = (thread.contacts as any).phone;
 
-  if (!org.twilio_account_sid || !org.twilio_auth_token) {
-    throw new Error('Twilio credentials not configured for organization');
+  // 2. Buscar configuração WhatsApp da org
+  const { data: integration, error: integrationError } = await supabase
+    .from('organization_integrations')
+    .select(`
+      config_values,
+      admin_integrations!inner(slug)
+    `)
+    .eq('organization_id', organizationId)
+    .eq('admin_integrations.slug', 'twilio-whatsapp')
+    .eq('is_enabled', true)
+    .single();
+
+  if (integrationError || !integration) {
+    throw new Error('WhatsApp integration not configured for organization');
   }
 
-  // 2. Formatar mensagem com botões (se houver)
+  const config = integration.config_values as WhatsAppConfig;
+
+  if (!config.account_sid || !config.auth_token) {
+    throw new Error('Twilio credentials not configured');
+  }
+
+  // 3. Formatar mensagem com botões (se houver)
   let messageBody = content;
 
   if (buttons && buttons.length > 0) {
@@ -51,7 +70,6 @@ export async function sendWhatsAppMessage(options: SendMessageOptions) {
 
     messageBody = `${content}\n\n${buttonsText}\n\n_Responda com o número da opção_`;
 
-    // Salvar estado de botões
     await supabase
       .from('message_threads')
       .update({
@@ -62,18 +80,18 @@ export async function sendWhatsAppMessage(options: SendMessageOptions) {
       .eq('organization_id', organizationId);
   }
 
-  // 3. Enviar via Twilio
-  const twilioClient = twilio(org.twilio_account_sid, org.twilio_auth_token);
+  // 4. Enviar via Twilio
+  const twilioClient = twilio(config.account_sid, config.auth_token);
 
   const message = await twilioClient.messages.create({
     body: messageBody,
-    from: `whatsapp:${org.whatsapp_phone_number}`,
+    from: `whatsapp:${config.whatsapp_number}`,
     to: `whatsapp:${customerPhone}`,
   });
 
   console.log(`📤 Message sent: ${message.sid}`);
 
-  // 4. Salvar mensagem no banco
+  // 5. Salvar mensagem
   await supabase
     .from('messages')
     .insert({
@@ -88,11 +106,11 @@ export async function sendWhatsAppMessage(options: SendMessageOptions) {
       metadata: buttons ? { interactive: true, buttons } : {},
     });
 
-  // 5. Esconder typing indicator
+  // 6. Esconder typing
   await supabase
     .from('message_threads')
-    .update({ 
-      agent_typing: false, 
+    .update({
+      agent_typing: false,
       agent_typing_at: null,
       updated_at: new Date().toISOString(),
     })
@@ -102,29 +120,23 @@ export async function sendWhatsAppMessage(options: SendMessageOptions) {
   return message;
 }
 
-/**
- * Mostra typing indicator
- */
 export async function showTypingIndicator(threadId: string, organizationId: string) {
   await supabase
     .from('message_threads')
-    .update({ 
-      agent_typing: true, 
-      agent_typing_at: new Date().toISOString() 
+    .update({
+      agent_typing: true,
+      agent_typing_at: new Date().toISOString()
     })
     .eq('id', threadId)
     .eq('organization_id', organizationId);
 }
 
-/**
- * Esconde typing indicator
- */
 export async function hideTypingIndicator(threadId: string, organizationId: string) {
   await supabase
     .from('message_threads')
-    .update({ 
-      agent_typing: false, 
-      agent_typing_at: null 
+    .update({
+      agent_typing: false,
+      agent_typing_at: null
     })
     .eq('id', threadId)
     .eq('organization_id', organizationId);
