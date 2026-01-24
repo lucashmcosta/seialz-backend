@@ -104,7 +104,6 @@ export async function sendWhatsAppMessage(options: SendMessageOptions) {
       whatsapp_message_sid: message.sid,
       whatsapp_status: 'sending',
       ai_processed: true,
-      metadata: buttons ? { interactive: true, buttons } : {},
     })
     .select('id')
     .single();
