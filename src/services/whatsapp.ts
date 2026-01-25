@@ -8,12 +8,7 @@ import type {
   WhatsAppMessageType,
   QuickReplyButton,
 } from '../types/whatsapp-messages.js';
-import {
-  validateInteractiveMessage,
-  prepareQuickReplyButtons,
-  truncateText,
-  WHATSAPP_LIMITS,
-} from '../types/whatsapp-messages.js';
+import { validateInteractiveMessage } from '../types/whatsapp-messages.js';
 import {
   createContentTemplate,
   createQuickReplyTemplate,
@@ -147,9 +142,15 @@ export async function sendWhatsAppMessage(options: SendMessageOptions): Promise<
           .eq('organization_id', organizationId);
       }
     } else if (buttons && buttons.length > 0) {
-      // Modo legado: botões como texto numerado
-      message = await sendLegacyButtonMessage(twilioClient, from, to, content, buttons);
-      messageBody = formatLegacyButtonMessage(content, buttons);
+      // Converter botões legados para interactive e usar template
+      const interactiveFromButtons: InteractiveMessage = {
+        type: 'quick_reply',
+        body: content,
+        quickReplyButtons: buttons,
+      };
+
+      message = await sendInteractiveMessage(twilioClient, from, to, interactiveFromButtons);
+      messageBody = content;
       messageType = 'quick_reply';
 
       await supabase
@@ -264,6 +265,7 @@ export async function sendWhatsAppMessage(options: SendMessageOptions): Promise<
 
 /**
  * Envia mensagem interativa baseada no tipo
+ * Usa Content Templates do Twilio - não faz fallback para texto
  */
 async function sendInteractiveMessage(
   client: Twilio,
@@ -279,21 +281,15 @@ async function sendInteractiveMessage(
   // Para outros tipos, criar Content Template
   const contentSid = await createContentTemplate(client, interactive);
 
-  if (contentSid) {
-    console.log(`📋 Using content template: ${contentSid}`);
-    return client.messages.create({
-      from,
-      to,
-      contentSid,
-    });
+  if (!contentSid) {
+    throw new Error(`Failed to create Content Template for type: ${interactive.type}`);
   }
 
-  // Fallback para texto simples se não conseguir criar template
-  console.warn('⚠️ Falling back to text message');
+  console.log(`📋 Using content template: ${contentSid}`);
   return client.messages.create({
     from,
     to,
-    body: formatFallbackMessage(interactive),
+    contentSid,
   });
 }
 
@@ -316,122 +312,6 @@ async function sendMediaMessage(
   });
 }
 
-/**
- * Envia mensagem com botões no formato legado (texto numerado)
- */
-async function sendLegacyButtonMessage(
-  client: Twilio,
-  from: string,
-  to: string,
-  content: string,
-  buttons: QuickReplyButton[]
-) {
-  const messageBody = formatLegacyButtonMessage(content, buttons);
-
-  return client.messages.create({
-    from,
-    to,
-    body: messageBody,
-  });
-}
-
-/**
- * Formata mensagem com botões no formato legado (texto numerado)
- */
-function formatLegacyButtonMessage(content: string, buttons: QuickReplyButton[]): string {
-  const preparedButtons = prepareQuickReplyButtons(buttons);
-  const buttonsText = preparedButtons
-    .map((b, i) => `${i + 1}. ${b.title}`)
-    .join('\n');
-
-  return `${content}\n\n${buttonsText}\n\n_Responda com o número da opção_`;
-}
-
-/**
- * Formata mensagem de fallback quando não consegue criar template interativo
- */
-function formatFallbackMessage(interactive: InteractiveMessage): string {
-  let message = interactive.body;
-
-  switch (interactive.type) {
-    case 'quick_reply':
-      if (interactive.quickReplyButtons) {
-        const buttons = prepareQuickReplyButtons(interactive.quickReplyButtons);
-        const buttonsText = buttons.map((b, i) => `${i + 1}. ${b.title}`).join('\n');
-        message += `\n\n${buttonsText}\n\n_Responda com o número da opção_`;
-      }
-      break;
-
-    case 'list':
-      if (interactive.listSections) {
-        message += '\n\n';
-        interactive.listSections.forEach((section) => {
-          if (section.title) {
-            message += `*${section.title}*\n`;
-          }
-          section.rows.forEach((row, i) => {
-            message += `${i + 1}. ${row.title}`;
-            if (row.description) {
-              message += ` - ${row.description}`;
-            }
-            message += '\n';
-          });
-          message += '\n';
-        });
-        message += '_Responda com o número da opção_';
-      }
-      break;
-
-    case 'cta':
-      if (interactive.ctaButtons) {
-        message += '\n\n';
-        interactive.ctaButtons.forEach((btn) => {
-          if (btn.type === 'url') {
-            message += `🔗 ${btn.title}: ${btn.url}\n`;
-          } else {
-            message += `📞 ${btn.title}: ${btn.phone}\n`;
-          }
-        });
-      }
-      break;
-
-    case 'location':
-      if (interactive.location) {
-        const loc = interactive.location;
-        message += `\n\n📍 ${loc.name || 'Location'}`;
-        if (loc.address) {
-          message += `\n${loc.address}`;
-        }
-        message += `\nhttps://maps.google.com/?q=${loc.latitude},${loc.longitude}`;
-      }
-      break;
-
-    case 'card':
-      if (interactive.card) {
-        message = `*${interactive.card.title}*`;
-        if (interactive.card.body) {
-          message += `\n\n${interactive.card.body}`;
-        }
-        if (interactive.card.actions) {
-          message += '\n\n';
-          interactive.card.actions.forEach((btn) => {
-            if (btn.type === 'url') {
-              message += `🔗 ${btn.title}: ${btn.url}\n`;
-            } else {
-              message += `📞 ${btn.title}: ${btn.phone}\n`;
-            }
-          });
-        }
-      }
-      break;
-  }
-
-  if (interactive.footer) {
-    message += `\n\n_${interactive.footer}_`;
-  }
-
-  return message;
-}
 
 /**
  * Mostra indicador de digitação
