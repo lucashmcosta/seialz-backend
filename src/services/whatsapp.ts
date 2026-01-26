@@ -121,7 +121,7 @@ export async function sendWhatsAppMessage(options: SendMessageOptions): Promise<
     }
 
     // NOVO FLUXO: Salvar primeiro para obter content normalizado pelo trigger
-    // 1. Salvar mensagem com status 'pending'
+    // 1. Salvar mensagem com status 'sending'
     console.log(`💾 Saving outbound message first (for trigger normalization)...`);
     const { data: insertedMsg, error: saveError } = await supabase
       .from('messages')
@@ -131,7 +131,7 @@ export async function sendWhatsAppMessage(options: SendMessageOptions): Promise<
         direction: 'outbound',
         content: messageBody,
         sender_type: 'agent',
-        whatsapp_status: 'pending',
+        whatsapp_status: 'sending',  // valores válidos: sending, sent, delivered, read, failed
         ai_processed: true,
         media_type: mediaUrl ? interactive?.media?.type : undefined,
         media_urls: mediaUrl ? [mediaUrl] : undefined,
