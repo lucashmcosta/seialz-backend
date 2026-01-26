@@ -175,7 +175,7 @@ WHERE direction = 'inbound' AND ai_processed = false;
 ## TODO
 
 - [ ] Migrar lógica completa do ai-agent-respond
-- [ ] Implementar RAG (busca de conhecimento)
+- [x] Implementar RAG (busca de conhecimento) - Voyage AI + Rerank
 - [ ] Adicionar transcrição de áudio
 - [ ] Adicionar webhook Gupshup
 - [ ] Implementar follow-up automático
