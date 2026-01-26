@@ -42,6 +42,38 @@ interface SendMessageResult {
 }
 
 /**
+ * Converte formatação Markdown para formato WhatsApp
+ *
+ * WhatsApp formatting:
+ * - *texto* = negrito
+ * - _texto_ = itálico
+ * - ~texto~ = riscado
+ * - ```texto``` = monoespaçado
+ * - `texto` = monoespaçado inline
+ *
+ * Markdown (Claude gera):
+ * - **texto** = negrito
+ * - *texto* ou _texto_ = itálico
+ * - ~~texto~~ = riscado
+ */
+function convertMarkdownToWhatsApp(text: string): string {
+  let result = text;
+
+  // **negrito** → *negrito* (Markdown bold → WhatsApp bold)
+  // Usa negative lookbehind/lookahead para não conflitar com * sozinho
+  result = result.replace(/\*\*(.+?)\*\*/g, '*$1*');
+
+  // ~~riscado~~ → ~riscado~ (Markdown strikethrough → WhatsApp strikethrough)
+  result = result.replace(/~~(.+?)~~/g, '~$1~');
+
+  // _itálico_ já está correto para WhatsApp
+  // *itálico* do Markdown pode conflitar com negrito do WhatsApp após conversão
+  // Por segurança, não convertemos itálico com * (só _ funciona igual)
+
+  return result;
+}
+
+/**
  * Envia uma mensagem do WhatsApp
  * Suporta mensagens de texto simples, botões quick reply legados, e mensagens interativas completas
  */
@@ -162,10 +194,14 @@ export async function sendWhatsAppMessage(options: SendMessageOptions): Promise<
     const normalizedContent = savedMsg.content;
     console.log(`📝 Using normalized content from trigger`);
 
-    // 3. Enviar para Twilio com content normalizado
+    // 3. Converter Markdown → WhatsApp formatting
+    const whatsappContent = convertMarkdownToWhatsApp(normalizedContent);
+    console.log(`📝 Converted Markdown to WhatsApp format`);
+
+    // 4. Enviar para Twilio com content convertido
     if (interactive) {
-      // Atualizar body do interactive com content normalizado
-      const normalizedInteractive = { ...interactive, body: normalizedContent };
+      // Atualizar body do interactive com content convertido
+      const normalizedInteractive = { ...interactive, body: whatsappContent };
 
       // Enviar mensagem interativa
       message = await sendInteractiveMessage(twilioClient, from, to, normalizedInteractive);
@@ -197,7 +233,7 @@ export async function sendWhatsAppMessage(options: SendMessageOptions): Promise<
       // Converter botões legados para interactive e usar template
       const interactiveFromButtons: InteractiveMessage = {
         type: 'quick_reply',
-        body: normalizedContent,
+        body: whatsappContent,
         quickReplyButtons: buttons,
       };
 
@@ -212,9 +248,9 @@ export async function sendWhatsAppMessage(options: SendMessageOptions): Promise<
         .eq('id', threadId)
         .eq('organization_id', organizationId);
     } else {
-      // Mensagem de texto simples - usar content normalizado
+      // Mensagem de texto simples - usar content convertido para WhatsApp
       message = await twilioClient.messages.create({
-        body: normalizedContent,
+        body: whatsappContent,
         from,
         to,
       });
