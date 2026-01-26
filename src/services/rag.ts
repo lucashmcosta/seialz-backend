@@ -1,13 +1,19 @@
 import { supabase } from '../lib/supabase.js';
 import { env } from '../config/env.js';
 
-// Tipos
+// =============================================================================
+// TIPOS
+// =============================================================================
+
 interface KnowledgeChunk {
+  id?: string;
   content: string;
   title?: string;
   scope?: 'product' | 'global';
   category?: string;
   similarity?: number;
+  product_id?: string;
+  product_name?: string;
 }
 
 interface RerankResult {
@@ -28,14 +34,74 @@ interface Product {
   slug?: string;
 }
 
-// Configuracoes
+interface RAGDebugInfo {
+  query: string;
+  detectedProducts: string[];
+  candidatesFound: number;
+  candidatesBySource: Record<string, number>;
+  topChunksAfterRerank: Array<{ title?: string; similarity?: number }>;
+}
+
+// =============================================================================
+// CONFIGURAÇÕES
+// =============================================================================
+
 const VOYAGE_API_URL = 'https://api.voyageai.com/v1';
-const EMBEDDING_MODEL = 'voyage-3';        // 1024 dimensoes
+const EMBEDDING_MODEL = 'voyage-3';
 const RERANK_MODEL = 'rerank-2';
-const CANDIDATE_COUNT = 30;                 // Buscar 30 candidatos
-const LOW_THRESHOLD = 0.30;                 // Threshold baixo para maximizar pool
-const EMERGENCY_THRESHOLD = 0.20;           // Fallback de emergencia
-const TOP_K_AFTER_RERANK = 5;               // Top 5 apos rerank
+const CANDIDATE_COUNT = 30;
+const LOW_THRESHOLD = 0.30;
+const EMERGENCY_THRESHOLD = 0.20;
+const TOP_K_AFTER_RERANK = 5;
+const MESSAGE_HISTORY_COUNT = 15;  // Aumentado de 3 para 15
+
+// =============================================================================
+// ALIASES DE PRODUTOS
+// Mapeamento de termos comuns para slugs de produtos
+// =============================================================================
+
+const PRODUCT_ALIASES: Record<string, string[]> = {
+  'visto-de-turista-eua': [
+    'visto de turismo',
+    'visto turismo',
+    'visto de turista',
+    'visto turista',
+    'visto americano',
+    'visto eua',
+    'visto usa',
+    'visto b1',
+    'visto b2',
+    'visto b1/b2',
+    'só o visto',
+    'somente o visto',
+    'apenas o visto',
+    'só visto',
+    'somente visto',
+  ],
+  'passaporte': [
+    'passaporte brasileiro',
+    'passaporte br',
+    'só passaporte',
+    'somente passaporte',
+    'apenas passaporte',
+    'só o passaporte',
+    'somente o passaporte',
+  ],
+  'visto-de-turista-e-passaporte': [
+    'combo',
+    'passaporte e visto',
+    'visto e passaporte',
+    'passaporte + visto',
+    'visto + passaporte',
+    'os dois',
+    'ambos',
+    'pacote completo',
+  ],
+};
+
+// =============================================================================
+// FUNÇÕES DE EMBEDDING E RERANK
+// =============================================================================
 
 /**
  * Gera embedding via Voyage AI
@@ -58,7 +124,7 @@ export async function generateEmbedding(text: string): Promise<number[] | null> 
       body: JSON.stringify({
         model: EMBEDDING_MODEL,
         input: text,
-        input_type: 'query',  // Otimizado para buscas
+        input_type: 'query',
       }),
     });
 
@@ -71,14 +137,8 @@ export async function generateEmbedding(text: string): Promise<number[] | null> 
     const data = await response.json();
     const embedding = data.data?.[0]?.embedding;
 
-    if (!embedding) {
-      console.error('❌ No embedding in response');
-      return null;
-    }
-
-    // Validar dimensoes (DEVE ser 1024 para voyage-3)
-    if (embedding.length !== 1024) {
-      console.error(`❌ Embedding dimension mismatch: got ${embedding.length}, expected 1024`);
+    if (!embedding || embedding.length !== 1024) {
+      console.error(`❌ Invalid embedding: got ${embedding?.length || 0} dims, expected 1024`);
       return null;
     }
 
@@ -99,7 +159,6 @@ export async function rerankResults(
 ): Promise<number[]> {
   const voyageApiKey = env.VOYAGE_API_KEY;
 
-  // Se poucos documentos, nao precisa rerankar
   if (documents.length <= topK) {
     return documents.map((_, i) => i);
   }
@@ -127,14 +186,12 @@ export async function rerankResults(
     if (!response.ok) {
       const error = await response.text();
       console.error('❌ Voyage rerank error:', error);
-      // Fallback: retorna primeiros documentos
       return documents.slice(0, topK).map((_, i) => i);
     }
 
     const data = await response.json();
     const results: RerankResult[] = data.data || [];
 
-    // Retorna indices dos documentos mais relevantes
     return results.map(r => r.index);
   } catch (error) {
     console.error('❌ Error reranking:', error);
@@ -142,27 +199,47 @@ export async function rerankResults(
   }
 }
 
+// =============================================================================
+// DETECÇÃO DE PRODUTOS (MÚLTIPLOS)
+// =============================================================================
+
 /**
- * Detecta produto mencionado no texto
+ * Detecta TODOS os produtos mencionados no texto (não apenas o primeiro)
+ * Usa aliases para melhor detecção
  */
-export function detectProductInMessage(
+export function detectAllProductsInMessage(
   messageText: string,
   products: Product[]
-): string | null {
+): string[] {
   const messageLower = messageText.toLowerCase();
+  const detectedIds = new Set<string>();
 
+  // 1. Primeiro, verificar aliases (mais específicos)
+  for (const [slug, aliases] of Object.entries(PRODUCT_ALIASES)) {
+    for (const alias of aliases) {
+      if (messageLower.includes(alias.toLowerCase())) {
+        // Encontrar o produto pelo slug
+        const product = products.find(p => p.slug === slug);
+        if (product) {
+          detectedIds.add(product.id);
+        }
+      }
+    }
+  }
+
+  // 2. Depois, verificar nome/slug direto dos produtos
   for (const product of products) {
     // Verifica nome do produto
     if (product.name && messageLower.includes(product.name.toLowerCase())) {
-      return product.id;
+      detectedIds.add(product.id);
     }
 
     // Verifica slug
     if (product.slug && messageLower.includes(product.slug.toLowerCase())) {
-      return product.id;
+      detectedIds.add(product.id);
     }
 
-    // Variacoes (sem hifen, com espaco)
+    // Variações do slug (sem hífen, com espaço)
     if (product.slug) {
       const variations = [
         product.slug.replace(/-/g, ' '),
@@ -170,81 +247,107 @@ export function detectProductInMessage(
       ];
       for (const variation of variations) {
         if (messageLower.includes(variation.toLowerCase())) {
-          return product.id;
+          detectedIds.add(product.id);
         }
       }
     }
   }
 
-  return null;
+  return Array.from(detectedIds);
 }
 
 /**
- * Busca conhecimento no Supabase
+ * Detecta produto único (backward compatibility)
  */
-async function searchKnowledge(
+export function detectProductInMessage(
+  messageText: string,
+  products: Product[]
+): string | null {
+  const detected = detectAllProductsInMessage(messageText, products);
+  return detected.length > 0 ? detected[0] : null;
+}
+
+// =============================================================================
+// BUSCA DE CONHECIMENTO (HÍBRIDA)
+// =============================================================================
+
+/**
+ * Busca conhecimento de forma híbrida:
+ * 1. Busca em TODOS os produtos detectados
+ * 2. SEMPRE busca em global
+ * 3. Se nenhum produto detectado, busca em TUDO
+ * 4. Merge e deduplica resultados
+ */
+async function searchKnowledgeHybrid(
   embedding: number[],
   organizationId: string,
-  productId: string | null
-): Promise<KnowledgeChunk[]> {
-  let candidates: KnowledgeChunk[] = [];
+  productIds: string[]
+): Promise<{ candidates: KnowledgeChunk[]; sourceStats: Record<string, number> }> {
+  const allCandidates: KnowledgeChunk[] = [];
+  const sourceStats: Record<string, number> = {};
 
   try {
-    // CASO 1: Sem produto detectado -> busca em TODO conhecimento
-    if (!productId) {
-      const { data: allResults, error } = await supabase.rpc('search_knowledge_all', {
-        query_embedding: embedding,
-        org_id: organizationId,
-        match_threshold: LOW_THRESHOLD,
-        match_count: CANDIDATE_COUNT,
-      });
+    // CASO 1: Produtos detectados - buscar em cada um + global
+    if (productIds.length > 0) {
+      // Buscar em cada produto detectado
+      for (const productId of productIds) {
+        const { data: productResults, error: productError } = await supabase.rpc('search_knowledge_product', {
+          query_embedding: embedding,
+          org_id: organizationId,
+          p_product_id: productId,
+          p_categories: null,
+          match_threshold: LOW_THRESHOLD,
+          match_count: CANDIDATE_COUNT,
+        });
 
-      if (error) {
-        console.error('❌ search_knowledge_all error:', error);
-      } else {
-        candidates = allResults || [];
+        if (productError) {
+          console.error(`❌ search_knowledge_product error for ${productId}:`, productError);
+        } else if (productResults) {
+          const resultsWithSource = productResults.map((r: KnowledgeChunk) => ({
+            ...r,
+            product_id: productId,
+          }));
+          allCandidates.push(...resultsWithSource);
+          sourceStats[`product_${productId}`] = productResults.length;
+        }
       }
-    }
-    // CASO 2: Com produto -> busca product-first + global fallback
-    else {
-      // Passo 1: Chunks especificos do produto
-      const { data: productResults, error: productError } = await supabase.rpc('search_knowledge_product', {
+
+      // SEMPRE buscar global também
+      const { data: globalResults, error: globalError } = await supabase.rpc('search_knowledge_global', {
         query_embedding: embedding,
         org_id: organizationId,
-        p_product_id: productId,
         p_categories: null,
         match_threshold: LOW_THRESHOLD,
         match_count: CANDIDATE_COUNT,
       });
 
-      if (productError) {
-        console.error('❌ search_knowledge_product error:', productError);
-      } else {
-        candidates = productResults || [];
+      if (globalError) {
+        console.error('❌ search_knowledge_global error:', globalError);
+      } else if (globalResults) {
+        allCandidates.push(...globalResults);
+        sourceStats['global'] = globalResults.length;
       }
+    }
+    // CASO 2: Nenhum produto detectado - buscar em TUDO
+    else {
+      const { data: allResults, error: allError } = await supabase.rpc('search_knowledge_all', {
+        query_embedding: embedding,
+        org_id: organizationId,
+        match_threshold: LOW_THRESHOLD,
+        match_count: CANDIDATE_COUNT,
+      });
 
-      // Passo 2: Completa com chunks globais se necessario
-      if (candidates.length < CANDIDATE_COUNT) {
-        const remaining = CANDIDATE_COUNT - candidates.length;
-        const { data: globalResults, error: globalError } = await supabase.rpc('search_knowledge_global', {
-          query_embedding: embedding,
-          org_id: organizationId,
-          p_categories: null,
-          match_threshold: LOW_THRESHOLD,
-          match_count: remaining,
-        });
-
-        if (globalError) {
-          console.error('❌ search_knowledge_global error:', globalError);
-        } else if (globalResults) {
-          candidates.push(...globalResults);
-        }
+      if (allError) {
+        console.error('❌ search_knowledge_all error:', allError);
+      } else if (allResults) {
+        allCandidates.push(...allResults);
+        sourceStats['all'] = allResults.length;
       }
     }
 
-    // Fallback de emergencia (threshold ainda mais baixo)
-    if (candidates.length === 0) {
-      console.log('⚠️ No candidates found, trying emergency fallback...');
+    // Fallback de emergência se não encontrou nada
+    if (allCandidates.length === 0) {
+      console.log('⚠️ No candidates found, trying emergency fallback (threshold: 0.20)...');
       const { data: fallbackResults, error: fallbackError } = await supabase.rpc('search_knowledge_all', {
         query_embedding: embedding,
         org_id: organizationId,
@@ -252,24 +355,35 @@ async function searchKnowledge(
         match_count: CANDIDATE_COUNT,
       });
 
-      if (fallbackError) {
-        console.error('❌ search_knowledge_all fallback error:', fallbackError);
-      } else {
-        candidates = fallbackResults || [];
+      if (!fallbackError && fallbackResults) {
+        allCandidates.push(...fallbackResults);
+        sourceStats['emergency_fallback'] = fallbackResults.length;
       }
     }
 
-    console.log(`📚 Found ${candidates.length} knowledge candidates`);
-    return candidates;
+    // Deduplica por content (remove duplicados exatos)
+    const seen = new Set<string>();
+    const uniqueCandidates = allCandidates.filter(c => {
+      const key = c.content.substring(0, 100); // Usa primeiros 100 chars como key
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    return { candidates: uniqueCandidates, sourceStats };
 
   } catch (error) {
-    console.error('❌ Error searching knowledge:', error);
-    return [];
+    console.error('❌ Error in searchKnowledgeHybrid:', error);
+    return { candidates: [], sourceStats: {} };
   }
 }
 
+// =============================================================================
+// FUNÇÕES AUXILIARES
+// =============================================================================
+
 /**
- * Busca produtos ativos da organizacao
+ * Busca produtos ativos da organização
  */
 export async function getOrganizationProducts(organizationId: string): Promise<Product[]> {
   try {
@@ -292,16 +406,16 @@ export async function getOrganizationProducts(organizationId: string): Promise<P
 }
 
 /**
- * Extrai contexto das ultimas mensagens do usuario (apenas inbound)
+ * Extrai contexto das últimas mensagens do usuário (aumentado para 15)
  */
 export function extractSearchContext(
   currentMessage: string,
   messageHistory: Array<{ content?: string; direction: string }>
 ): string {
-  // Apenas mensagens INBOUND (do usuario) - evita poluicao do assistente
+  // Apenas mensagens INBOUND (do usuário) - últimas 15
   const recentUserMessages = messageHistory
     .filter(m => m.direction === 'inbound')
-    .slice(-3)
+    .slice(-MESSAGE_HISTORY_COUNT)
     .map(m => m.content || '')
     .filter(c => c.trim() !== '')
     .join(' ');
@@ -314,8 +428,13 @@ export function extractSearchContext(
   return currentMessage;
 }
 
+// =============================================================================
+// FUNÇÃO PRINCIPAL: getRelevantContext
+// =============================================================================
+
 /**
- * Funcao principal: busca contexto relevante para RAG
+ * Função principal: busca contexto relevante para RAG
+ * Usa busca híbrida com múltiplos produtos
  */
 export async function getRelevantContext(
   message: string,
@@ -324,35 +443,46 @@ export async function getRelevantContext(
 ): Promise<RAGContext[]> {
   console.log('🔍 Starting RAG retrieval...');
 
-  // 1. Buscar produtos da organizacao
+  const debugInfo: Partial<RAGDebugInfo> = {};
+
+  // 1. Buscar produtos da organização
   const products = await getOrganizationProducts(organizationId);
   console.log(`   Found ${products.length} products`);
 
-  // 2. Detectar produto na mensagem atual
-  let detectedProductId = detectProductInMessage(message, products);
+  // 2. Extrair contexto de busca (usa últimas 15 mensagens)
+  const searchContext = extractSearchContext(message, messageHistory);
+  debugInfo.query = searchContext.substring(0, 200);
+  console.log(`   Search context: "${searchContext.substring(0, 100)}..."`);
 
-  // Se nao encontrou, verifica ultimas 5 mensagens do historico
-  if (!detectedProductId && messageHistory.length > 0) {
-    const recentMessages = messageHistory.slice(-5).reverse();
+  // 3. Detectar TODOS os produtos mencionados (mensagem atual + histórico)
+  let detectedProductIds = detectAllProductsInMessage(message, products);
+
+  // Se não encontrou, verifica no histórico (últimas 10 mensagens)
+  if (detectedProductIds.length === 0 && messageHistory.length > 0) {
+    const recentMessages = messageHistory.slice(-10).reverse();
     for (const msg of recentMessages) {
       if (msg.content) {
-        const detected = detectProductInMessage(msg.content, products);
-        if (detected) {
-          detectedProductId = detected;
+        const detected = detectAllProductsInMessage(msg.content, products);
+        if (detected.length > 0) {
+          detectedProductIds = detected;
           break;
         }
       }
     }
   }
 
-  if (detectedProductId) {
-    const product = products.find(p => p.id === detectedProductId);
-    console.log(`   Detected product: ${product?.name || detectedProductId}`);
+  // Log produtos detectados
+  if (detectedProductIds.length > 0) {
+    const productNames = detectedProductIds.map(id => {
+      const p = products.find(prod => prod.id === id);
+      return p?.name || id;
+    });
+    console.log(`   Detected products: ${productNames.join(', ')}`);
+    debugInfo.detectedProducts = productNames;
+  } else {
+    console.log('   No specific product detected, searching all');
+    debugInfo.detectedProducts = [];
   }
-
-  // 3. Extrair contexto de busca
-  const searchContext = extractSearchContext(message, messageHistory);
-  console.log(`   Search context: "${searchContext.substring(0, 100)}..."`);
 
   // 4. Gerar embedding
   const embedding = await generateEmbedding(searchContext);
@@ -362,14 +492,25 @@ export async function getRelevantContext(
   }
   console.log('   Embedding generated (1024 dims)');
 
-  // 5. Buscar candidatos no Supabase
-  const candidates = await searchKnowledge(embedding, organizationId, detectedProductId);
+  // 5. Busca híbrida (múltiplos produtos + global)
+  const { candidates, sourceStats } = await searchKnowledgeHybrid(
+    embedding,
+    organizationId,
+    detectedProductIds
+  );
+
+  debugInfo.candidatesFound = candidates.length;
+  debugInfo.candidatesBySource = sourceStats;
+
+  console.log(`📚 Found ${candidates.length} knowledge candidates`);
+  console.log(`   Sources: ${JSON.stringify(sourceStats)}`);
+
   if (candidates.length === 0) {
     console.log('⚠️ No knowledge candidates found');
     return [];
   }
 
-  // 6. Rerankar resultados
+  // 6. Rerankar todos os resultados juntos
   const documents = candidates.map(c => c.content);
   const rerankedIndices = await rerankResults(searchContext, documents, TOP_K_AFTER_RERANK);
   console.log(`   Reranked to top ${rerankedIndices.length} results`);
@@ -385,12 +526,23 @@ export async function getRelevantContext(
       category: chunk.category || 'geral',
     }));
 
+  // Log debug dos chunks finais
+  debugInfo.topChunksAfterRerank = results.map(r => ({
+    title: r.title,
+    category: r.category,
+  }));
+  console.log(`   Final chunks: ${results.map(r => r.title || 'untitled').join(', ')}`);
+
   console.log(`✅ RAG retrieval complete: ${results.length} chunks`);
   return results;
 }
 
+// =============================================================================
+// FORMATAÇÃO DO CONTEXTO RAG
+// =============================================================================
+
 /**
- * Formata contexto RAG para injecao no system prompt
+ * Formata contexto RAG para injeção no system prompt
  */
 export function formatRAGContext(contexts: RAGContext[]): string {
   if (contexts.length === 0) {
@@ -399,7 +551,7 @@ export function formatRAGContext(contexts: RAGContext[]): string {
 
   let formatted = `
 ## BASE DE CONHECIMENTO (USE OBRIGATORIAMENTE)
-Os seguintes documentos contem informacoes VERIFICADAS. Use-os para responder:
+Os seguintes documentos contêm informações VERIFICADAS. Use-os para responder:
 
 `;
 
@@ -413,11 +565,11 @@ ${ctx.content}
   }
 
   formatted += `
-⚠️ REGRA ANTI-ALUCINACAO (PRIORIDADE MAXIMA):
-Se a informacao NAO estiver nos documentos acima, responda:
-"Nao tenho essa informacao confirmada. Posso verificar com nossa equipe e retornar."
+⚠️ REGRA ANTI-ALUCINAÇÃO (PRIORIDADE MÁXIMA):
+Se a informação NÃO estiver nos documentos acima, responda:
+"Não tenho essa informação confirmada. Posso verificar com nossa equipe e retornar."
 
-NUNCA invente precos, prazos, especificacoes ou dados que nao estejam explicitamente documentados.
+NUNCA invente preços, prazos, links ou dados que não estejam explicitamente documentados.
 `;
 
   return formatted;
