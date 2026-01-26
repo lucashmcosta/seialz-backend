@@ -12,10 +12,6 @@ interface ProcessMessageOptions {
   messageCount?: number;
 }
 
-interface QuickReplyButton {
-  id: string;
-  title: string;
-}
 
 /**
  * Processa mensagem com AI e envia resposta
@@ -103,26 +99,20 @@ export async function processAIMessage(options: ProcessMessageOptions) {
     // 5. TODO: Implementar RAG aqui
     // const knowledge = await searchRelevantKnowledge(message, organizationId);
 
-    // 6. System prompt com instruções de botões
+    // 6. System prompt - sem botões de texto
     const systemPrompt = `${agent.system_prompt || 'Você é um assistente prestativo.'}
 
 ## TOM DE COMUNICAÇÃO
 - Seja informal e natural, como uma conversa no WhatsApp
 - Não use emojis excessivos
-- Não use listas com bullets ou números (exceto botões)
 - Frases curtas e diretas
 
-## BOTÕES DE RESPOSTA RÁPIDA
-Quando fizer sentido, ofereça opções usando botões:
-
-[BUTTONS]
-- Opção 1
-- Opção 2
-- Opção 3
-[/BUTTONS]
-
-Máximo 3 botões, máximo 20 caracteres cada.
-Use apenas quando facilitar a conversa.`;
+## REGRAS IMPORTANTES
+❌ NUNCA use tags [BUTTONS], [OPTIONS] ou similares
+❌ NUNCA formate opções como lista numerada (1. 2. 3.)
+❌ NUNCA ofereça "escolha uma das opções abaixo" ou similares
+✅ Responda de forma natural e fluída
+✅ Se precisar dar opções, incorpore naturalmente no texto`;
 
     // 7. Chamar Claude
     const response = await anthropic.messages.create({
@@ -138,54 +128,17 @@ Use apenas quando facilitar a conversa.`;
 
     console.log(`✅ AI response generated: "${aiResponse.substring(0, 100)}..."`);
 
-    // 8. Parsear botões da resposta
-    const { text, buttons } = parseButtonsFromResponse(aiResponse);
-
-    // 9. Enviar resposta
+    // 8. Enviar resposta (texto simples, sem botões)
     await sendWhatsAppMessage({
       threadId,
       organizationId,
-      content: text,
-      buttons: buttons || undefined,
+      content: aiResponse,
     });
 
-    return { success: true, response: text };
+    return { success: true, response: aiResponse };
 
   } catch (error) {
     console.error('❌ AI processing error:', error);
     throw error;
   }
-}
-
-/**
- * Extrai botões da resposta do AI
- */
-function parseButtonsFromResponse(response: string): {
-  text: string;
-  buttons: QuickReplyButton[] | null;
-} {
-  const buttonRegex = /\[BUTTONS\]([\s\S]*?)\[\/BUTTONS\]/;
-  const match = response.match(buttonRegex);
-
-  if (!match) {
-    return { text: response, buttons: null };
-  }
-
-  const buttonSection = match[1];
-  const buttons = buttonSection
-    .split('\n')
-    .map(line => line.trim())
-    .filter(line => line.startsWith('-'))
-    .map((line, index) => ({
-      id: `btn_${index + 1}`,
-      title: line.replace(/^-\s*/, '').slice(0, 20),
-    }))
-    .slice(0, 3);
-
-  const text = response.replace(buttonRegex, '').trim();
-
-  return {
-    text,
-    buttons: buttons.length > 0 ? buttons : null,
-  };
 }
