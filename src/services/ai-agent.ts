@@ -106,13 +106,18 @@ function analyzeNameQuality(name: string | null): 'real' | 'suspicious' | 'unkno
   const suspiciousPatterns = [
     /^[a-z]\.[a-z]\.?$/i,           // "g.s.", "m.s."
     /^[a-z]{1,2}$/i,                // "gs", "ms"
-    /^.{1,3}$/,                      // Muito curto (1-3 chars)
-    /[✨🌟💫⭐️🔥💖]/,              // Emojis decorativos
     /^(mae|pai|tia|tio|vo)\s/i,     // "Mae do Pedro"
     /^\+?\d{10,}/,                   // Numero de telefone
-    /^[^a-zA-Z\s]+$/,               // Sem letras
+    /^[^a-zA-ZÀ-ÿ\s]+$/,            // Sem letras (incluindo acentuadas)
     /^(admin|user|cliente|test)/i,   // Nomes genericos
+    /^[\p{Emoji}\p{Emoji_Presentation}\p{Extended_Pictographic}\s]+$/u,  // Apenas emojis
   ];
+
+  // Verifica se é muito curto (menos de 3 letras)
+  const lettersOnly = trimmed.replace(/[^a-zA-ZÀ-ÿ]/g, '');
+  if (lettersOnly.length < 3) {
+    return 'suspicious';
+  }
 
   for (const pattern of suspiciousPatterns) {
     if (pattern.test(trimmed)) {
