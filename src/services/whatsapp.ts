@@ -97,9 +97,10 @@ export async function sendWhatsAppMessage(options: SendMessageOptions): Promise<
   let messageBody = content;
   let messageType: WhatsAppMessageType = 'text';
   let mediaUrl: string | undefined;
+  let savedMsg: { id: string; content: string } | null = null;
 
   try {
-    // Determinar tipo de mensagem e enviar
+    // Determinar tipo de mensagem
     if (interactive) {
       // Validar mensagem interativa
       const validation = validateInteractiveMessage(interactive);
@@ -110,13 +111,64 @@ export async function sendWhatsAppMessage(options: SendMessageOptions): Promise<
       messageType = interactive.type;
       messageBody = interactive.body;
 
-      // Enviar mensagem interativa
-      message = await sendInteractiveMessage(twilioClient, from, to, interactive);
-
       // Extrair URL de mídia se houver
       if (interactive.media?.url) {
         mediaUrl = interactive.media.url;
       }
+    } else if (buttons && buttons.length > 0) {
+      messageBody = content;
+      messageType = 'quick_reply';
+    }
+
+    // NOVO FLUXO: Salvar primeiro para obter content normalizado pelo trigger
+    // 1. Salvar mensagem com status 'pending'
+    console.log(`💾 Saving outbound message first (for trigger normalization)...`);
+    const { data: insertedMsg, error: saveError } = await supabase
+      .from('messages')
+      .insert({
+        organization_id: organizationId,
+        thread_id: threadId,
+        direction: 'outbound',
+        content: messageBody,
+        sender_type: 'agent',
+        whatsapp_status: 'pending',
+        ai_processed: true,
+        media_type: mediaUrl ? interactive?.media?.type : undefined,
+        media_urls: mediaUrl ? [mediaUrl] : undefined,
+        metadata: {
+          message_type: messageType,
+          interactive: interactive ? {
+            type: interactive.type,
+            has_buttons: !!interactive.quickReplyButtons?.length,
+            has_list: !!interactive.listSections?.length,
+            has_cta: !!interactive.ctaButtons?.length,
+            has_media: !!interactive.media,
+            has_location: !!interactive.location,
+          } : undefined,
+        },
+      })
+      .select('id, content')  // Buscar content normalizado pelo trigger
+      .single();
+
+    if (saveError || !insertedMsg) {
+      console.error('❌ Error saving outbound message:', saveError);
+      throw saveError || new Error('Failed to save message');
+    }
+
+    savedMsg = insertedMsg;
+    console.log(`✅ Outbound message saved: ${savedMsg.id}`);
+
+    // 2. Usar o content normalizado pelo trigger do Supabase
+    const normalizedContent = savedMsg.content;
+    console.log(`📝 Using normalized content from trigger`);
+
+    // 3. Enviar para Twilio com content normalizado
+    if (interactive) {
+      // Atualizar body do interactive com content normalizado
+      const normalizedInteractive = { ...interactive, body: normalizedContent };
+
+      // Enviar mensagem interativa
+      message = await sendInteractiveMessage(twilioClient, from, to, normalizedInteractive);
 
       // Atualizar thread se for quick reply ou list (aguardando resposta)
       if (interactive.type === 'quick_reply' && interactive.quickReplyButtons) {
@@ -145,13 +197,11 @@ export async function sendWhatsAppMessage(options: SendMessageOptions): Promise<
       // Converter botões legados para interactive e usar template
       const interactiveFromButtons: InteractiveMessage = {
         type: 'quick_reply',
-        body: content,
+        body: normalizedContent,
         quickReplyButtons: buttons,
       };
 
       message = await sendInteractiveMessage(twilioClient, from, to, interactiveFromButtons);
-      messageBody = content;
-      messageType = 'quick_reply';
 
       await supabase
         .from('message_threads')
@@ -162,9 +212,9 @@ export async function sendWhatsAppMessage(options: SendMessageOptions): Promise<
         .eq('id', threadId)
         .eq('organization_id', organizationId);
     } else {
-      // Mensagem de texto simples
+      // Mensagem de texto simples - usar content normalizado
       message = await twilioClient.messages.create({
-        body: content,
+        body: normalizedContent,
         from,
         to,
       });
@@ -172,42 +222,14 @@ export async function sendWhatsAppMessage(options: SendMessageOptions): Promise<
 
     console.log(`📤 Message sent to Twilio: ${message.sid}`);
 
-    // 5. Salvar mensagem
-    console.log(`💾 Saving outbound message...`);
-    const { data: savedMsg, error: saveError } = await supabase
+    // 4. Atualizar mensagem com SID do Twilio e status
+    await supabase
       .from('messages')
-      .insert({
-        organization_id: organizationId,
-        thread_id: threadId,
-        direction: 'outbound',
-        content: messageBody,
-        sender_type: 'agent',
+      .update({
         whatsapp_message_sid: message.sid,
         whatsapp_status: 'sending',
-        ai_processed: true,
-        media_type: mediaUrl ? interactive?.media?.type : undefined,
-        media_urls: mediaUrl ? [mediaUrl] : undefined,
-        metadata: {
-          message_type: messageType,
-          interactive: interactive ? {
-            type: interactive.type,
-            has_buttons: !!interactive.quickReplyButtons?.length,
-            has_list: !!interactive.listSections?.length,
-            has_cta: !!interactive.ctaButtons?.length,
-            has_media: !!interactive.media,
-            has_location: !!interactive.location,
-          } : undefined,
-        },
       })
-      .select('id')
-      .single();
-
-    if (saveError) {
-      console.error('❌ Error saving outbound message:', saveError);
-      throw saveError;
-    }
-
-    console.log(`✅ Outbound message saved: ${savedMsg.id}`);
+      .eq('id', savedMsg.id);
 
     // 6. Esconder typing
     await supabase
@@ -228,21 +250,38 @@ export async function sendWhatsAppMessage(options: SendMessageOptions): Promise<
   } catch (error) {
     console.error('❌ Error sending WhatsApp message:', error);
 
-    // Tentar salvar mensagem com status de erro
-    const { data: savedMsg } = await supabase
-      .from('messages')
-      .insert({
-        organization_id: organizationId,
-        thread_id: threadId,
-        direction: 'outbound',
-        content: messageBody,
-        sender_type: 'agent',
-        whatsapp_status: 'failed',
-        error_message: error instanceof Error ? error.message : 'Unknown error',
-        ai_processed: true,
-      })
-      .select('id')
-      .single();
+    // Se a mensagem já foi salva (savedMsg existe), atualizar status para failed
+    // Caso contrário, inserir nova mensagem com status failed
+    let errorMessageId = '';
+
+    if (savedMsg?.id) {
+      // Atualizar mensagem existente com erro
+      await supabase
+        .from('messages')
+        .update({
+          whatsapp_status: 'failed',
+          error_message: error instanceof Error ? error.message : 'Unknown error',
+        })
+        .eq('id', savedMsg.id);
+      errorMessageId = savedMsg.id;
+    } else {
+      // Salvar nova mensagem com erro (caso erro tenha ocorrido antes do insert)
+      const { data: errorMsg } = await supabase
+        .from('messages')
+        .insert({
+          organization_id: organizationId,
+          thread_id: threadId,
+          direction: 'outbound',
+          content: messageBody,
+          sender_type: 'agent',
+          whatsapp_status: 'failed',
+          error_message: error instanceof Error ? error.message : 'Unknown error',
+          ai_processed: true,
+        })
+        .select('id')
+        .single();
+      errorMessageId = errorMsg?.id || '';
+    }
 
     // Esconder typing mesmo em caso de erro
     await supabase
@@ -256,7 +295,7 @@ export async function sendWhatsAppMessage(options: SendMessageOptions): Promise<
 
     return {
       messageSid: '',
-      savedMessageId: savedMsg?.id || '',
+      savedMessageId: errorMessageId,
       status: 'failed',
       error: error instanceof Error ? error.message : 'Unknown error',
     };
