@@ -417,6 +417,8 @@ export async function processAIMessage(options: ProcessMessageOptions) {
 
     // 5. Construir instrucao de nome
     const nameInstruction = buildNameInstruction(contact?.full_name, memories);
+    const nameQuality = analyzeNameQuality(contact?.full_name);
+    console.log(`👤 Name analysis: "${contact?.full_name}" → quality: ${nameQuality}, confirmed: ${memories?.name_confirmed}, asked: ${memories?.name_asked}`);
 
     // 6. Buscar contexto RAG (base de conhecimento)
     console.log('🔍 Fetching RAG context...');
@@ -433,7 +435,11 @@ export async function processAIMessage(options: ProcessMessageOptions) {
       console.log('⚠️ RAG: No relevant knowledge found');
     }
 
-    // 7. System prompt
+    // 7. System prompt - NOME no final para dar prioridade
+    const needsToAskName = nameQuality === 'suspicious' || nameQuality === 'unknown';
+    const nameNotAskedYet = !memories?.name_confirmed && !memories?.name_asked;
+    const shouldAskName = needsToAskName && nameNotAskedYet;
+
     const systemPrompt = `${agent.system_prompt || 'Voce e um assistente prestativo.'}
 ${ragSection}
 
@@ -441,9 +447,6 @@ ${ragSection}
 - Nome atual: ${contact?.full_name || 'Nao informado'}
 - Email: ${contact?.email || 'Nao informado'}
 - Telefone: ${contact?.phone || 'Nao informado'}
-
-## STATUS DO NOME DO CONTATO
-${nameInstruction}
 
 ## TOM DE COMUNICACAO
 - Seja informal e natural, como uma conversa no WhatsApp
@@ -453,7 +456,29 @@ ${nameInstruction}
 ## REGRAS IMPORTANTES
 NUNCA use tags [BUTTONS], [OPTIONS] ou similares
 NUNCA formate opcoes como lista numerada (1. 2. 3.)
-Responda de forma natural e fluida`;
+Responda de forma natural e fluida
+
+${shouldAskName ? `
+## ⚠️ AÇÃO OBRIGATÓRIA - PERGUNTAR NOME (PRIORIDADE MÁXIMA)
+O nome atual "${contact?.full_name || 'Nao informado'}" NÃO é o nome real do cliente (é um número de telefone ou apelido).
+
+VOCÊ DEVE fazer isso NA SUA RESPOSTA:
+1. Responder brevemente à pergunta do cliente
+2. E NO FINAL, perguntar o nome de forma natural:
+   "A propósito, qual seu nome completo para eu te atender melhor?"
+   OU "Para continuar, posso saber seu nome completo?"
+
+3. DEPOIS de enviar a resposta, use a tool mark_name_asked
+
+EXEMPLO DE RESPOSTA CORRETA:
+"Olá! Claro, posso te ajudar com informações sobre nossos serviços de visto!
+A propósito, qual seu nome completo para eu te atender melhor?"
+
+⚠️ NÃO RESPONDA SEM PERGUNTAR O NOME!
+` : `
+## STATUS DO NOME
+${nameInstruction}
+`}`;
 
     // 8. Chamar Claude
     let response = await anthropic.messages.create({
