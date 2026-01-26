@@ -1,6 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { supabase } from '../lib/supabase.js';
 import { sendWhatsAppMessage } from './whatsapp.js';
+import { getRelevantContext, formatRAGContext } from './rag.js';
 
 interface ProcessMessageOptions {
   threadId: string;
@@ -417,8 +418,24 @@ export async function processAIMessage(options: ProcessMessageOptions) {
     // 5. Construir instrucao de nome
     const nameInstruction = buildNameInstruction(contact?.full_name, memories);
 
-    // 6. System prompt
+    // 6. Buscar contexto RAG (base de conhecimento)
+    console.log('🔍 Fetching RAG context...');
+    const messageHistoryForRAG = (history || []).map(m => ({
+      content: m.content,
+      direction: m.direction,
+    }));
+    const ragContexts = await getRelevantContext(message, organizationId, messageHistoryForRAG);
+    const ragSection = formatRAGContext(ragContexts);
+
+    if (ragContexts.length > 0) {
+      console.log(`📚 RAG: ${ragContexts.length} knowledge chunks injected`);
+    } else {
+      console.log('⚠️ RAG: No relevant knowledge found');
+    }
+
+    // 7. System prompt
     const systemPrompt = `${agent.system_prompt || 'Voce e um assistente prestativo.'}
+${ragSection}
 
 ## CONTEXTO DO CONTATO
 - Nome atual: ${contact?.full_name || 'Nao informado'}
@@ -438,7 +455,7 @@ NUNCA use tags [BUTTONS], [OPTIONS] ou similares
 NUNCA formate opcoes como lista numerada (1. 2. 3.)
 Responda de forma natural e fluida`;
 
-    // 7. Chamar Claude
+    // 8. Chamar Claude
     let response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 1024,
@@ -447,7 +464,7 @@ Responda de forma natural e fluida`;
       tools: AVAILABLE_TOOLS,
     });
 
-    // 8. Processar tool calls
+    // 9. Processar tool calls
     const toolsExecuted: string[] = [];
     let currentMessages = [...validMessages];
     let maxIterations = 5;
@@ -492,7 +509,7 @@ Responda de forma natural e fluida`;
       });
     }
 
-    // 9. Extrair resposta
+    // 10. Extrair resposta
     const textBlock = response.content.find(
       (block): block is Anthropic.TextBlock => block.type === 'text'
     );
@@ -528,7 +545,7 @@ Responda de forma natural e fluida`;
     console.log(`✅ AI response: "${aiResponse.substring(0, 100)}..."`);
     console.log(`   Tools: ${toolsExecuted.join(', ') || 'none'}`);
 
-    // 10. Enviar resposta
+    // 11. Enviar resposta
     await sendWhatsAppMessage({
       threadId,
       organizationId,
