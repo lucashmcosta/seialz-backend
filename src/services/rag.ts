@@ -100,6 +100,112 @@ const PRODUCT_ALIASES: Record<string, string[]> = {
 };
 
 // =============================================================================
+// DETECÇÃO DE MENSAGENS SIMPLES (ACKNOWLEDGMENTS)
+// =============================================================================
+
+/**
+ * Mensagens que são acknowledgments simples e não requerem RAG
+ * Estas mensagens indicam que o usuário está apenas confirmando/agradecendo
+ */
+const SIMPLE_ACKNOWLEDGMENTS = [
+  // Agradecimentos
+  'obrigado', 'obrigada', 'obg', 'vlw', 'valeu', 'thanks', 'thank you',
+  'muito obrigado', 'muito obrigada', 'brigado', 'brigada',
+  // Confirmações simples
+  'ok', 'okay', 'tá', 'ta', 'tá bom', 'ta bom', 'beleza', 'blz', 'show',
+  'perfeito', 'perfeita', 'ótimo', 'otimo', 'ótima', 'otima', 'maravilha',
+  'certo', 'entendi', 'entendido', 'compreendi', 'compreendido',
+  'legal', 'massa', 'top', 'nice', 'boa', 'bom',
+  // Despedidas
+  'tchau', 'até', 'ate', 'até mais', 'ate mais', 'até logo', 'ate logo',
+  'bye', 'adeus', 'falou', 'flw', 'fui',
+  // Saudações que não precisam de RAG
+  'bom dia', 'boa tarde', 'boa noite', 'oi', 'olá', 'ola', 'hello', 'hi',
+];
+
+/**
+ * Padrões regex para detectar acknowledgments mais complexos
+ */
+const ACKNOWLEDGMENT_PATTERNS = [
+  /^(muito\s+)?obrigad[oa]/i,
+  /^(ok|okay|tá|ta|beleza|blz|show|perfeito|ótimo|legal)/i,
+  /^(entendi|entendido|compreendi)/i,
+  /^(tchau|até|bye|adeus|falou|flw)/i,
+  /^(bom dia|boa tarde|boa noite|oi|olá)/i,
+  /^[\s\p{Emoji}]*$/u,  // Apenas emojis ou espaços
+];
+
+/**
+ * Verifica se uma mensagem é um acknowledgment simples
+ * Essas mensagens não precisam de RAG porque são apenas confirmações
+ */
+export function isSimpleAcknowledgment(message: string): boolean {
+  const normalized = message.toLowerCase().trim();
+
+  // Mensagens muito curtas (menos de 3 chars úteis) geralmente são acknowledgments
+  if (normalized.replace(/[^\w]/g, '').length < 3) {
+    return true;
+  }
+
+  // Verifica lista de acknowledgments conhecidos
+  if (SIMPLE_ACKNOWLEDGMENTS.includes(normalized)) {
+    return true;
+  }
+
+  // Verifica padrões regex
+  for (const pattern of ACKNOWLEDGMENT_PATTERNS) {
+    if (pattern.test(normalized)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Verifica se deve pular RAG para esta mensagem
+ * Retorna true se a mensagem não precisa de contexto da knowledge base
+ */
+export function shouldSkipRAG(
+  message: string,
+  messageHistory: Array<{ content?: string; direction: string }> = []
+): { skip: boolean; reason?: string } {
+  // 1. Verifica se é acknowledgment simples
+  if (isSimpleAcknowledgment(message)) {
+    return {
+      skip: true,
+      reason: 'Simple acknowledgment detected (obrigado, ok, etc.)'
+    };
+  }
+
+  // 2. Se a mensagem tem menos de 5 palavras E não menciona nada específico
+  const words = message.trim().split(/\s+/);
+  if (words.length < 5) {
+    // Verifica se tem keywords que indicam necessidade de RAG
+    const needsRAGKeywords = [
+      'preço', 'preco', 'valor', 'custo', 'quanto',
+      'link', 'pagar', 'pagamento', 'pix',
+      'prazo', 'tempo', 'demora', 'quanto tempo',
+      'como', 'onde', 'quando', 'qual',
+      'documento', 'documentos', 'requisito',
+      'visto', 'passaporte', 'combo',
+    ];
+
+    const messageLower = message.toLowerCase();
+    const hasRAGKeyword = needsRAGKeywords.some(k => messageLower.includes(k));
+
+    if (!hasRAGKeyword) {
+      return {
+        skip: true,
+        reason: 'Short message without specific keywords'
+      };
+    }
+  }
+
+  return { skip: false };
+}
+
+// =============================================================================
 // FUNÇÕES DE EMBEDDING E RERANK
 // =============================================================================
 
@@ -435,6 +541,8 @@ export function extractSearchContext(
 /**
  * Função principal: busca contexto relevante para RAG
  * Usa busca híbrida com múltiplos produtos
+ *
+ * IMPORTANTE: Verifica se deve pular RAG para mensagens simples (acknowledgments)
  */
 export async function getRelevantContext(
   message: string,
@@ -442,6 +550,13 @@ export async function getRelevantContext(
   messageHistory: Array<{ content?: string; direction: string }> = []
 ): Promise<RAGContext[]> {
   console.log('🔍 Starting RAG retrieval...');
+
+  // NOVO: Verificar se deve pular RAG (acknowledgments, mensagens simples)
+  const skipCheck = shouldSkipRAG(message, messageHistory);
+  if (skipCheck.skip) {
+    console.log(`⏭️ Skipping RAG: ${skipCheck.reason}`);
+    return [];
+  }
 
   const debugInfo: Partial<RAGDebugInfo> = {};
 
@@ -454,12 +569,28 @@ export async function getRelevantContext(
   debugInfo.query = searchContext.substring(0, 200);
   console.log(`   Search context: "${searchContext.substring(0, 100)}..."`);
 
-  // 3. Detectar TODOS os produtos mencionados (mensagem atual + histórico)
-  let detectedProductIds = detectAllProductsInMessage(message, products);
+  // 3. Detectar produtos - PRIORIZA CLARIFICAÇÕES RECENTES
+  // Se a mensagem atual tem palavras de clarificação (só, somente, apenas),
+  // usar APENAS a mensagem atual para detecção
+  const clarificationKeywords = ['só', 'somente', 'apenas', 'só o', 'somente o', 'apenas o'];
+  const messageLower = message.toLowerCase();
+  const isClarification = clarificationKeywords.some(k => messageLower.includes(k));
 
-  // Se não encontrou, verifica no histórico (últimas 10 mensagens)
-  if (detectedProductIds.length === 0 && messageHistory.length > 0) {
-    const recentMessages = messageHistory.slice(-10).reverse();
+  let detectedProductIds: string[] = [];
+
+  if (isClarification) {
+    // PRIORIDADE: Usar apenas a mensagem atual (é uma clarificação)
+    detectedProductIds = detectAllProductsInMessage(message, products);
+    console.log(`   🎯 Clarification detected - using only current message for product detection`);
+  } else {
+    // Comportamento normal: detecta na mensagem atual
+    detectedProductIds = detectAllProductsInMessage(message, products);
+  }
+
+  // Se não encontrou na mensagem atual E não é clarificação, verifica histórico
+  if (detectedProductIds.length === 0 && !isClarification && messageHistory.length > 0) {
+    // NOVO: Verifica apenas as últimas 5 mensagens (não 10) para evitar pegar contexto muito antigo
+    const recentMessages = messageHistory.slice(-5).reverse();
     for (const msg of recentMessages) {
       if (msg.content) {
         const detected = detectAllProductsInMessage(msg.content, products);
