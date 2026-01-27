@@ -125,6 +125,9 @@ export async function sendWhatsAppMessage(options: SendMessageOptions): Promise<
   const from = `whatsapp:${config.whatsapp_number}`;
   const to = `whatsapp:${customerPhone}`;
 
+  // URL do StatusCallback para receber atualizações de delivered/read
+  const statusCallbackUrl = `https://qvmtzfvkhkhkhdpclzua.supabase.co/functions/v1/twilio-whatsapp-webhook/status?orgId=${organizationId}`;
+
   let message;
   let messageBody = content;
   let messageType: WhatsAppMessageType = 'text';
@@ -204,7 +207,7 @@ export async function sendWhatsAppMessage(options: SendMessageOptions): Promise<
       const normalizedInteractive = { ...interactive, body: whatsappContent };
 
       // Enviar mensagem interativa
-      message = await sendInteractiveMessage(twilioClient, from, to, normalizedInteractive);
+      message = await sendInteractiveMessage(twilioClient, from, to, normalizedInteractive, statusCallbackUrl);
 
       // Atualizar thread se for quick reply ou list (aguardando resposta)
       if (interactive.type === 'quick_reply' && interactive.quickReplyButtons) {
@@ -237,7 +240,7 @@ export async function sendWhatsAppMessage(options: SendMessageOptions): Promise<
         quickReplyButtons: buttons,
       };
 
-      message = await sendInteractiveMessage(twilioClient, from, to, interactiveFromButtons);
+      message = await sendInteractiveMessage(twilioClient, from, to, interactiveFromButtons, statusCallbackUrl);
 
       await supabase
         .from('message_threads')
@@ -253,17 +256,20 @@ export async function sendWhatsAppMessage(options: SendMessageOptions): Promise<
         body: whatsappContent,
         from,
         to,
+        statusCallback: statusCallbackUrl,
       });
     }
 
     console.log(`📤 Message sent to Twilio: ${message.sid}`);
 
-    // 4. Atualizar mensagem com SID do Twilio e status
+    // 4. Atualizar mensagem com SID do Twilio e status para 'sent'
+    // O Twilio aceitou a mensagem (retornou SID), então atualizamos para 'sent'
+    // Status subsequentes (delivered, read) virão via StatusCallback
     await supabase
       .from('messages')
       .update({
         whatsapp_message_sid: message.sid,
-        whatsapp_status: 'sending',
+        whatsapp_status: 'sent',
       })
       .eq('id', savedMsg.id);
 
@@ -346,11 +352,12 @@ async function sendInteractiveMessage(
   client: Twilio,
   from: string,
   to: string,
-  interactive: InteractiveMessage
+  interactive: InteractiveMessage,
+  statusCallbackUrl: string
 ) {
   // Para mídia simples, usar mediaUrl diretamente (mais eficiente)
   if (interactive.type === 'media' && interactive.media) {
-    return sendMediaMessage(client, from, to, interactive);
+    return sendMediaMessage(client, from, to, interactive, statusCallbackUrl);
   }
 
   // Para outros tipos, criar Content Template
@@ -365,6 +372,7 @@ async function sendInteractiveMessage(
     from,
     to,
     contentSid,
+    statusCallback: statusCallbackUrl,
   });
 }
 
@@ -375,7 +383,8 @@ async function sendMediaMessage(
   client: Twilio,
   from: string,
   to: string,
-  interactive: InteractiveMessage
+  interactive: InteractiveMessage,
+  statusCallbackUrl: string
 ) {
   const media = interactive.media!;
 
@@ -384,6 +393,7 @@ async function sendMediaMessage(
     to,
     body: media.caption || '',
     mediaUrl: [media.url],
+    statusCallback: statusCallbackUrl,
   });
 }
 
