@@ -110,36 +110,38 @@ async function getTwilioClient(organizationId: string): Promise<{ client: Twilio
 
 /**
  * Constrói o payload para a Twilio Content API baseado no tipo de template
+ * Formato correto: "twilio/text", "twilio/quick-reply", etc.
  */
 function buildTwilioContentPayload(data: CreateTemplateInput): object {
-  const baseTypes: Record<string, object> = {
-    // Sempre incluir fallback de texto
-    twilioText: {
-      body: data.body,
-    },
-  };
+  const types: Record<string, object> = {};
 
   switch (data.template_type) {
     case 'text':
-      // Apenas texto simples
+      types['twilio/text'] = {
+        body: data.body,
+      };
       break;
 
     case 'quick-reply':
       if (data.buttons && data.buttons.length > 0) {
-        baseTypes.twilioQuickReply = {
+        types['twilio/quick-reply'] = {
           body: data.body,
           actions: data.buttons.map(btn => ({
-            type: 'QUICK_REPLY',
-            title: btn.title,
             id: btn.id,
+            title: btn.title,
           })),
+        };
+      } else {
+        // Fallback para texto se não houver botões
+        types['twilio/text'] = {
+          body: data.body,
         };
       }
       break;
 
     case 'call-to-action':
       if (data.actions && data.actions.length > 0) {
-        baseTypes.twilioCallToAction = {
+        types['twilio/call-to-action'] = {
           body: data.body,
           actions: data.actions
             .filter(a => a.type === 'url' || a.type === 'phone')
@@ -159,13 +161,18 @@ function buildTwilioContentPayload(data: CreateTemplateInput): object {
               }
             }),
         };
+      } else {
+        // Fallback para texto se não houver ações
+        types['twilio/text'] = {
+          body: data.body,
+        };
       }
       break;
 
     case 'list-picker':
       if (data.actions && data.actions.length > 0) {
         const listItems = data.actions.filter(a => a.type === 'list_item');
-        baseTypes.twilioListPicker = {
+        types['twilio/list-picker'] = {
           body: data.body,
           button: 'Ver opções',
           items: listItems.map((item, index) => ({
@@ -174,19 +181,27 @@ function buildTwilioContentPayload(data: CreateTemplateInput): object {
             description: item.description,
           })),
         };
+      } else {
+        // Fallback para texto se não houver itens
+        types['twilio/text'] = {
+          body: data.body,
+        };
       }
       break;
 
     case 'media':
-      // Media templates são tratados de forma diferente
-      // Por enquanto, usamos apenas o texto
+    default:
+      // Default para texto simples
+      types['twilio/text'] = {
+        body: data.body,
+      };
       break;
   }
 
   return {
     friendlyName: data.friendly_name,
     language: data.language || 'pt_BR',
-    types: baseTypes,
+    types,
     // Incluir variáveis se existirem
     ...(data.variables && data.variables.length > 0 && {
       variables: data.variables.reduce((acc, v) => {
@@ -763,19 +778,20 @@ export async function syncAllTemplates(organizationId: string): Promise<{
       }
 
       // Extrair body do content
+      // Twilio retorna types com chaves no formato "twilio/text", "twilio/quick-reply", etc.
       const contentTypes = content.types as Record<string, any>;
-      const body = contentTypes?.twilioText?.body ||
-                   contentTypes?.twilioQuickReply?.body ||
-                   contentTypes?.twilioCallToAction?.body ||
-                   contentTypes?.twilioListPicker?.body ||
+      const body = contentTypes?.['twilio/text']?.body ||
+                   contentTypes?.['twilio/quick-reply']?.body ||
+                   contentTypes?.['twilio/call-to-action']?.body ||
+                   contentTypes?.['twilio/list-picker']?.body ||
                    '';
 
       // Determinar tipo
       let templateType = 'text';
-      if (contentTypes?.twilioQuickReply) templateType = 'quick-reply';
-      else if (contentTypes?.twilioCallToAction) templateType = 'call-to-action';
-      else if (contentTypes?.twilioListPicker) templateType = 'list-picker';
-      else if (contentTypes?.twilioMedia) templateType = 'media';
+      if (contentTypes?.['twilio/quick-reply']) templateType = 'quick-reply';
+      else if (contentTypes?.['twilio/call-to-action']) templateType = 'call-to-action';
+      else if (contentTypes?.['twilio/list-picker']) templateType = 'list-picker';
+      else if (contentTypes?.['twilio/media']) templateType = 'media';
 
       if (existing) {
         // Atualizar existente
