@@ -5,6 +5,7 @@ import { serve } from 'inngest/fastify';
 import { env } from './config/env.js';
 import { inngest } from './lib/inngest.js';
 import { twilioWebhookRoutes } from './webhooks/twilio.js';
+import { whatsappTemplateRoutes } from './routes/whatsapp-templates.js';
 import { processMessageBatch } from './inngest/functions/process-message-batch.js';
 
 // Criar servidor Fastify
@@ -41,6 +42,13 @@ app.get('/', async () => {
 
 // Twilio WhatsApp
 await twilioWebhookRoutes(app);
+
+// ===========================
+// API ROUTES
+// ===========================
+
+// WhatsApp Templates API
+await whatsappTemplateRoutes(app);
 
 // ===========================
 // INNGEST
@@ -82,6 +90,10 @@ const start = async () => {
 ║   Webhooks:                                               ║
 ║   - Twilio: POST /webhook/twilio/whatsapp                 ║
 ║   - Status: POST /webhook/twilio/status                   ║
+║                                                           ║
+║   API:                                                    ║
+║   - Templates: /api/whatsapp/templates                    ║
+║   - Send: POST /api/whatsapp/send                         ║
 ║                                                           ║
 ╚═══════════════════════════════════════════════════════════╝
     `);
