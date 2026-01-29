@@ -78,6 +78,7 @@ interface ListTemplatesQuery extends OrgIdQuery {
   status?: string;
   template_type?: string;
   is_active?: string;
+  source?: string; // 'user', 'twilio_sample', 'twilio_tryout', 'all'
 }
 
 // ===========================
@@ -89,12 +90,18 @@ export async function whatsappTemplateRoutes(app: FastifyInstance) {
   // ===========================
   // GET /api/whatsapp/templates
   // Lista templates de uma organização
+  // Query params:
+  //   - orgId (required)
+  //   - status: approved, pending, rejected, not_submitted, sample
+  //   - template_type: text, quick-reply, list-picker, call-to-action, media
+  //   - is_active: true/false
+  //   - source: user (default), twilio_sample, twilio_tryout, all
   // ===========================
   app.get('/api/whatsapp/templates', async (
     request: FastifyRequest<{ Querystring: ListTemplatesQuery }>,
     reply: FastifyReply
   ) => {
-    const { orgId, status, template_type, is_active } = request.query;
+    const { orgId, status, template_type, is_active, source } = request.query;
 
     if (!orgId) {
       return reply.status(400).send({ error: 'Missing orgId parameter' });
@@ -105,6 +112,7 @@ export async function whatsappTemplateRoutes(app: FastifyInstance) {
         status,
         template_type,
         is_active: is_active === 'true' ? true : is_active === 'false' ? false : undefined,
+        source: source || 'user', // Por padrão, mostrar apenas templates do usuário
       });
 
       return reply.send(templates);
