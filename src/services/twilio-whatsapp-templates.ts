@@ -1,11 +1,20 @@
 // src/services/twilio-whatsapp-templates.ts
 // Serviço para gerenciar WhatsApp Business Message Templates via Twilio Content API
+//
+// IMPORTANTE: A Content API do Twilio é acessada via HTTP direto (fetch).
+// O SDK do Twilio (client.messages.create) é usado APENAS para enviar mensagens.
 
 import twilio from 'twilio';
 import type { Twilio } from 'twilio';
 import { supabase } from '../lib/supabase.js';
 import { env } from '../config/env.js';
 import type { TemplateVariable, TemplateButton, TemplateAction } from '../lib/template-validation.js';
+
+// ===========================
+// CONSTANTS
+// ===========================
+
+const TWILIO_CONTENT_API_BASE = 'https://content.twilio.com/v1';
 
 // ===========================
 // TYPES
@@ -70,8 +79,17 @@ interface SendMessageInput {
   thread_id?: string;
 }
 
+interface TwilioContentResponse {
+  sid: string;
+  friendly_name: string;
+  language: string;
+  types: Record<string, any>;
+  date_created: string;
+  date_updated: string;
+}
+
 // ===========================
-// HELPERS
+// HELPERS - CONFIG
 // ===========================
 
 /**
@@ -98,7 +116,8 @@ async function getWhatsAppConfig(organizationId: string): Promise<WhatsAppConfig
 }
 
 /**
- * Cria cliente Twilio para uma organização
+ * Cria cliente Twilio para envio de mensagens (SDK)
+ * NOTA: Usar apenas para client.messages.create()
  */
 async function getTwilioClient(organizationId: string): Promise<{ client: Twilio; config: WhatsAppConfig } | null> {
   const config = await getWhatsAppConfig(organizationId);
@@ -109,8 +128,118 @@ async function getTwilioClient(organizationId: string): Promise<{ client: Twilio
 }
 
 /**
+ * Gera header de autenticação Basic para a Content API
+ */
+function getAuthHeader(config: WhatsAppConfig): string {
+  return 'Basic ' + Buffer.from(`${config.account_sid}:${config.auth_token}`).toString('base64');
+}
+
+// ===========================
+// HELPERS - CONTENT API (HTTP)
+// ===========================
+
+/**
+ * Cria um Content Template no Twilio via HTTP
+ * POST https://content.twilio.com/v1/Content
+ */
+async function createTwilioContent(
+  config: WhatsAppConfig,
+  payload: object
+): Promise<TwilioContentResponse> {
+  console.log('📤 Twilio Content API - Creating template:', JSON.stringify(payload, null, 2));
+
+  const response = await fetch(`${TWILIO_CONTENT_API_BASE}/Content`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': getAuthHeader(config),
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    console.error('❌ Twilio Content API error:', errorData);
+    throw new Error(errorData.message || `Failed to create content: ${response.status}`);
+  }
+
+  return response.json();
+}
+
+/**
+ * Lista Content Templates do Twilio via HTTP
+ * GET https://content.twilio.com/v1/Content
+ */
+async function listTwilioContents(
+  config: WhatsAppConfig,
+  limit: number = 100
+): Promise<TwilioContentResponse[]> {
+  const response = await fetch(`${TWILIO_CONTENT_API_BASE}/Content?PageSize=${limit}`, {
+    method: 'GET',
+    headers: {
+      'Authorization': getAuthHeader(config),
+    },
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(errorData.message || `Failed to list contents: ${response.status}`);
+  }
+
+  const data = await response.json();
+  return data.contents || [];
+}
+
+/**
+ * Busca um Content Template do Twilio via HTTP
+ * GET https://content.twilio.com/v1/Content/{sid}
+ */
+async function getTwilioContent(
+  config: WhatsAppConfig,
+  contentSid: string
+): Promise<TwilioContentResponse | null> {
+  const response = await fetch(`${TWILIO_CONTENT_API_BASE}/Content/${contentSid}`, {
+    method: 'GET',
+    headers: {
+      'Authorization': getAuthHeader(config),
+    },
+  });
+
+  if (!response.ok) {
+    if (response.status === 404) return null;
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(errorData.message || `Failed to get content: ${response.status}`);
+  }
+
+  return response.json();
+}
+
+/**
+ * Deleta um Content Template do Twilio via HTTP
+ * DELETE https://content.twilio.com/v1/Content/{sid}
+ */
+async function deleteTwilioContent(
+  config: WhatsAppConfig,
+  contentSid: string
+): Promise<boolean> {
+  const response = await fetch(`${TWILIO_CONTENT_API_BASE}/Content/${contentSid}`, {
+    method: 'DELETE',
+    headers: {
+      'Authorization': getAuthHeader(config),
+    },
+  });
+
+  // 204 = success, 404 = already deleted
+  return response.ok || response.status === 404;
+}
+
+// ===========================
+// HELPERS - PAYLOAD BUILDER
+// ===========================
+
+/**
  * Constrói o payload para a Twilio Content API baseado no tipo de template
- * Formato correto: "twilio/text", "twilio/quick-reply", etc.
+ * Formato: { friendly_name, language, types: { "twilio/text": { body } } }
  */
 function buildTwilioContentPayload(data: CreateTemplateInput): object {
   const types: Record<string, object> = {};
@@ -132,10 +261,7 @@ function buildTwilioContentPayload(data: CreateTemplateInput): object {
           })),
         };
       } else {
-        // Fallback para texto se não houver botões
-        types['twilio/text'] = {
-          body: data.body,
-        };
+        types['twilio/text'] = { body: data.body };
       }
       break;
 
@@ -147,25 +273,14 @@ function buildTwilioContentPayload(data: CreateTemplateInput): object {
             .filter(a => a.type === 'url' || a.type === 'phone')
             .map(action => {
               if (action.type === 'url') {
-                return {
-                  type: 'URL',
-                  title: action.title,
-                  url: action.url,
-                };
+                return { type: 'URL', title: action.title, url: action.url };
               } else {
-                return {
-                  type: 'PHONE_NUMBER',
-                  title: action.title,
-                  phone: action.phone,
-                };
+                return { type: 'PHONE_NUMBER', title: action.title, phone: action.phone };
               }
             }),
         };
       } else {
-        // Fallback para texto se não houver ações
-        types['twilio/text'] = {
-          body: data.body,
-        };
+        types['twilio/text'] = { body: data.body };
       }
       break;
 
@@ -182,34 +297,32 @@ function buildTwilioContentPayload(data: CreateTemplateInput): object {
           })),
         };
       } else {
-        // Fallback para texto se não houver itens
-        types['twilio/text'] = {
-          body: data.body,
-        };
+        types['twilio/text'] = { body: data.body };
       }
       break;
 
     case 'media':
     default:
-      // Default para texto simples
-      types['twilio/text'] = {
-        body: data.body,
-      };
+      types['twilio/text'] = { body: data.body };
       break;
   }
 
-  return {
-    friendlyName: data.friendly_name,
+  // Payload final conforme documentação Twilio
+  const payload: Record<string, any> = {
+    friendly_name: data.friendly_name,
     language: data.language || 'pt_BR',
     types,
-    // Incluir variáveis se existirem
-    ...(data.variables && data.variables.length > 0 && {
-      variables: data.variables.reduce((acc, v) => {
-        acc[v.key] = v.example;
-        return acc;
-      }, {} as Record<string, string>),
-    }),
   };
+
+  // Incluir variáveis se existirem
+  if (data.variables && data.variables.length > 0) {
+    payload.variables = data.variables.reduce((acc, v) => {
+      acc[v.key] = v.example;
+      return acc;
+    }, {} as Record<string, string>);
+  }
+
+  return payload;
 }
 
 // ===========================
@@ -268,7 +381,7 @@ export async function getTemplate(
     .single();
 
   if (error) {
-    if (error.code === 'PGRST116') return null; // Not found
+    if (error.code === 'PGRST116') return null;
     console.error('❌ Error getting template:', error);
     throw new Error(`Failed to get template: ${error.message}`);
   }
@@ -310,7 +423,6 @@ async function saveTemplateActions(
 
   const actionsToInsert: Partial<TemplateAction_DB>[] = [];
 
-  // Converter buttons para ações
   if (buttons && buttons.length > 0) {
     buttons.forEach((btn, index) => {
       actionsToInsert.push({
@@ -323,7 +435,6 @@ async function saveTemplateActions(
     });
   }
 
-  // Converter actions
   if (actions && actions.length > 0) {
     actions.forEach((action, index) => {
       actionsToInsert.push({
@@ -362,17 +473,15 @@ export async function createTemplate(
 ): Promise<WhatsAppTemplate> {
   console.log(`📝 Creating template "${data.friendly_name}" for org: ${organizationId}`);
 
-  const twilioData = await getTwilioClient(organizationId);
-  if (!twilioData) {
+  const config = await getWhatsAppConfig(organizationId);
+  if (!config) {
     throw new Error('WhatsApp integration not configured');
   }
 
-  const { client } = twilioData;
-
   try {
-    // 1. Criar no Twilio Content API
+    // 1. Criar no Twilio Content API via HTTP
     const payload = buildTwilioContentPayload(data);
-    const content = await client.content.v1.contents.create(payload as any);
+    const content = await createTwilioContent(config, payload);
 
     console.log(`✅ Created Twilio content: ${content.sid}`);
 
@@ -398,7 +507,7 @@ export async function createTemplate(
 
     if (error || !template) {
       // Rollback: deletar do Twilio
-      await client.content.v1.contents(content.sid).remove();
+      await deleteTwilioContent(config, content.sid);
       throw new Error(`Failed to save template: ${error?.message}`);
     }
 
@@ -424,31 +533,26 @@ export async function updateTemplate(
 ): Promise<WhatsAppTemplate> {
   console.log(`📝 Updating template ${templateId} for org: ${organizationId}`);
 
-  // 1. Buscar template existente
   const existing = await getTemplate(organizationId, templateId);
   if (!existing) {
     throw new Error('Template not found');
   }
 
-  const twilioData = await getTwilioClient(organizationId);
-  if (!twilioData) {
+  const config = await getWhatsAppConfig(organizationId);
+  if (!config) {
     throw new Error('WhatsApp integration not configured');
   }
 
-  const { client } = twilioData;
-
   try {
-    // 2. Deletar o Content antigo do Twilio
+    // 1. Deletar o Content antigo do Twilio
     if (existing.twilio_content_sid) {
-      try {
-        await client.content.v1.contents(existing.twilio_content_sid).remove();
+      const deleted = await deleteTwilioContent(config, existing.twilio_content_sid);
+      if (deleted) {
         console.log(`🗑️ Deleted old Twilio content: ${existing.twilio_content_sid}`);
-      } catch (e) {
-        console.warn('⚠️ Could not delete old Twilio content:', e);
       }
     }
 
-    // 3. Criar novo Content no Twilio com dados mesclados
+    // 2. Criar novo Content no Twilio com dados mesclados
     const mergedData: CreateTemplateInput = {
       friendly_name: data.friendly_name || existing.friendly_name,
       language: data.language || existing.language,
@@ -463,11 +567,11 @@ export async function updateTemplate(
     };
 
     const payload = buildTwilioContentPayload(mergedData);
-    const content = await client.content.v1.contents.create(payload as any);
+    const content = await createTwilioContent(config, payload);
 
     console.log(`✅ Created new Twilio content: ${content.sid}`);
 
-    // 4. Atualizar no banco
+    // 3. Atualizar no banco
     const { data: template, error } = await supabase
       .from('whatsapp_templates')
       .update({
@@ -480,7 +584,7 @@ export async function updateTemplate(
         footer: mergedData.footer,
         variables: mergedData.variables || [],
         category: mergedData.category,
-        status: 'not_submitted', // Reset status após edição - precisa re-submeter para aprovação
+        status: 'not_submitted',
         updated_at: new Date().toISOString(),
       })
       .eq('organization_id', organizationId)
@@ -492,7 +596,7 @@ export async function updateTemplate(
       throw new Error(`Failed to update template: ${error?.message}`);
     }
 
-    // 5. Atualizar ações
+    // 4. Atualizar ações
     if (data.buttons || data.actions) {
       await saveTemplateActions(template.id, data.buttons, data.actions);
     }
@@ -515,25 +619,22 @@ export async function deleteTemplate(
 ): Promise<void> {
   console.log(`🗑️ Deleting template ${templateId} for org: ${organizationId}`);
 
-  // 1. Buscar template
   const template = await getTemplate(organizationId, templateId);
   if (!template) {
     throw new Error('Template not found');
   }
 
-  const twilioData = await getTwilioClient(organizationId);
+  const config = await getWhatsAppConfig(organizationId);
 
-  // 2. Deletar do Twilio (se configurado)
-  if (twilioData && template.twilio_content_sid) {
-    try {
-      await twilioData.client.content.v1.contents(template.twilio_content_sid).remove();
+  // Deletar do Twilio (se configurado)
+  if (config && template.twilio_content_sid) {
+    const deleted = await deleteTwilioContent(config, template.twilio_content_sid);
+    if (deleted) {
       console.log(`✅ Deleted from Twilio: ${template.twilio_content_sid}`);
-    } catch (e) {
-      console.warn('⚠️ Could not delete from Twilio:', e);
     }
   }
 
-  // 3. Soft delete no banco
+  // Soft delete no banco
   const { error } = await supabase
     .from('whatsapp_templates')
     .update({
@@ -556,6 +657,7 @@ export async function deleteTemplate(
 
 /**
  * Submete um template para aprovação do WhatsApp
+ * POST https://content.twilio.com/v1/Content/{sid}/ApprovalRequests/whatsapp
  */
 export async function submitForApproval(
   organizationId: string,
@@ -569,22 +671,19 @@ export async function submitForApproval(
     throw new Error('Template not found');
   }
 
-  const twilioData = await getTwilioClient(organizationId);
-  if (!twilioData) {
+  const config = await getWhatsAppConfig(organizationId);
+  if (!config) {
     throw new Error('WhatsApp integration not configured');
   }
 
-  const { config } = twilioData;
-
   try {
-    // Twilio Content API - Submit for approval
     const response = await fetch(
-      `https://content.twilio.com/v1/Content/${template.twilio_content_sid}/ApprovalRequests/whatsapp`,
+      `${TWILIO_CONTENT_API_BASE}/Content/${template.twilio_content_sid}/ApprovalRequests/whatsapp`,
       {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': 'Basic ' + Buffer.from(`${config.account_sid}:${config.auth_token}`).toString('base64'),
+          'Authorization': getAuthHeader(config),
         },
         body: JSON.stringify({
           name: template.friendly_name,
@@ -594,11 +693,9 @@ export async function submitForApproval(
     );
 
     if (!response.ok) {
-      const errorData = await response.json();
-      throw new Error(errorData.message || 'Failed to submit for approval');
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.message || `Failed to submit: ${response.status}`);
     }
-
-    const data = await response.json();
 
     // Atualizar status no banco
     await supabase
@@ -621,6 +718,7 @@ export async function submitForApproval(
 
 /**
  * Busca status de aprovação de um template
+ * GET https://content.twilio.com/v1/Content/{sid}/ApprovalRequests
  */
 export async function getApprovalStatus(
   organizationId: string,
@@ -631,26 +729,23 @@ export async function getApprovalStatus(
     throw new Error('Template not found');
   }
 
-  const twilioData = await getTwilioClient(organizationId);
-  if (!twilioData) {
+  const config = await getWhatsAppConfig(organizationId);
+  if (!config) {
     throw new Error('WhatsApp integration not configured');
   }
 
-  const { config } = twilioData;
-
   try {
     const response = await fetch(
-      `https://content.twilio.com/v1/Content/${template.twilio_content_sid}/ApprovalRequests`,
+      `${TWILIO_CONTENT_API_BASE}/Content/${template.twilio_content_sid}/ApprovalRequests`,
       {
         method: 'GET',
         headers: {
-          'Authorization': 'Basic ' + Buffer.from(`${config.account_sid}:${config.auth_token}`).toString('base64'),
+          'Authorization': getAuthHeader(config),
         },
       }
     );
 
     if (!response.ok) {
-      // Se não há approval request, retornar status atual
       return { status: template.status, rejection_reason: template.rejection_reason };
     }
 
@@ -661,7 +756,6 @@ export async function getApprovalStatus(
       const newStatus = whatsappApproval.status?.toLowerCase() || template.status;
       const rejectionReason = whatsappApproval.rejection_reason;
 
-      // Atualizar no banco se mudou
       if (newStatus !== template.status) {
         await supabase
           .from('whatsapp_templates')
@@ -693,22 +787,20 @@ export async function getApprovalStatus(
  * Lista todos os Content Templates do Twilio
  */
 export async function listTemplatesFromTwilio(organizationId: string): Promise<any[]> {
-  const twilioData = await getTwilioClient(organizationId);
-  if (!twilioData) {
+  const config = await getWhatsAppConfig(organizationId);
+  if (!config) {
     throw new Error('WhatsApp integration not configured');
   }
 
-  const { client } = twilioData;
-
   try {
-    const contents = await client.content.v1.contents.list({ limit: 100 });
+    const contents = await listTwilioContents(config, 100);
     return contents.map(c => ({
       sid: c.sid,
-      friendlyName: c.friendlyName,
+      friendlyName: c.friendly_name,
       language: c.language,
       types: c.types,
-      dateCreated: c.dateCreated,
-      dateUpdated: c.dateUpdated,
+      dateCreated: c.date_created,
+      dateUpdated: c.date_updated,
     }));
   } catch (error: any) {
     console.error('❌ Error listing Twilio templates:', error);
@@ -726,24 +818,21 @@ export async function syncAllTemplates(organizationId: string): Promise<{
 }> {
   console.log(`🔄 Syncing templates for org: ${organizationId}`);
 
-  const twilioData = await getTwilioClient(organizationId);
-  if (!twilioData) {
+  const config = await getWhatsAppConfig(organizationId);
+  if (!config) {
     throw new Error('WhatsApp integration not configured');
   }
-
-  const { client, config } = twilioData;
 
   let synced = 0;
   let added = 0;
   let updated = 0;
 
   try {
-    // 1. Buscar todos os Content do Twilio
-    const twilioContents = await client.content.v1.contents.list({ limit: 100 });
+    // 1. Buscar todos os Content do Twilio via HTTP
+    const twilioContents = await listTwilioContents(config, 100);
 
     // 2. Para cada content, verificar se existe no banco e atualizar
     for (const content of twilioContents) {
-      // Buscar template existente pelo SID
       const { data: existing } = await supabase
         .from('whatsapp_templates')
         .select('id')
@@ -757,11 +846,11 @@ export async function syncAllTemplates(organizationId: string): Promise<{
 
       try {
         const approvalResponse = await fetch(
-          `https://content.twilio.com/v1/Content/${content.sid}/ApprovalRequests`,
+          `${TWILIO_CONTENT_API_BASE}/Content/${content.sid}/ApprovalRequests`,
           {
             method: 'GET',
             headers: {
-              'Authorization': 'Basic ' + Buffer.from(`${config.account_sid}:${config.auth_token}`).toString('base64'),
+              'Authorization': getAuthHeader(config),
             },
           }
         );
@@ -778,7 +867,6 @@ export async function syncAllTemplates(organizationId: string): Promise<{
       }
 
       // Extrair body do content
-      // Twilio retorna types com chaves no formato "twilio/text", "twilio/quick-reply", etc.
       const contentTypes = content.types as Record<string, any>;
       const body = contentTypes?.['twilio/text']?.body ||
                    contentTypes?.['twilio/quick-reply']?.body ||
@@ -794,7 +882,6 @@ export async function syncAllTemplates(organizationId: string): Promise<{
       else if (contentTypes?.['twilio/media']) templateType = 'media';
 
       if (existing) {
-        // Atualizar existente
         await supabase
           .from('whatsapp_templates')
           .update({
@@ -804,16 +891,14 @@ export async function syncAllTemplates(organizationId: string): Promise<{
             updated_at: new Date().toISOString(),
           })
           .eq('id', existing.id);
-
         updated++;
       } else {
-        // Criar novo
         await supabase
           .from('whatsapp_templates')
           .insert({
             organization_id: organizationId,
             twilio_content_sid: content.sid,
-            friendly_name: content.friendlyName || `template_${content.sid}`,
+            friendly_name: content.friendly_name || `template_${content.sid}`,
             language: content.language || 'pt_BR',
             template_type: templateType,
             body: body,
@@ -822,7 +907,6 @@ export async function syncAllTemplates(organizationId: string): Promise<{
             is_active: true,
             last_synced_at: new Date().toISOString(),
           });
-
         added++;
       }
 
@@ -839,11 +923,12 @@ export async function syncAllTemplates(organizationId: string): Promise<{
 }
 
 // ===========================
-// MESSAGE SENDING
+// MESSAGE SENDING (usa SDK)
 // ===========================
 
 /**
  * Envia uma mensagem usando um template
+ * NOTA: Esta função usa o SDK do Twilio (client.messages.create)
  */
 export async function sendTemplateMessage(
   organizationId: string,
@@ -851,7 +936,6 @@ export async function sendTemplateMessage(
 ): Promise<{ messageId: string; whatsappSid: string }> {
   console.log(`📤 Sending template message to ${input.to}`);
 
-  // 1. Buscar template
   const template = await getTemplate(organizationId, input.template_id);
   if (!template) {
     throw new Error('Template not found');
@@ -861,7 +945,7 @@ export async function sendTemplateMessage(
     throw new Error('Template is not active');
   }
 
-  // 2. Buscar config do Twilio
+  // Usar SDK do Twilio para enviar mensagens
   const twilioData = await getTwilioClient(organizationId);
   if (!twilioData) {
     throw new Error('WhatsApp integration not configured');
@@ -869,20 +953,18 @@ export async function sendTemplateMessage(
 
   const { client, config } = twilioData;
 
-  // 3. Formatar número
   const to = input.to.startsWith('whatsapp:') ? input.to : `whatsapp:${input.to}`;
   const from = config.whatsapp_number.startsWith('whatsapp:')
     ? config.whatsapp_number
     : `whatsapp:${config.whatsapp_number}`;
 
-  // 4. Preparar variáveis de conteúdo
   let contentVariables: Record<string, string> | undefined;
   if (input.variables && Object.keys(input.variables).length > 0) {
     contentVariables = input.variables;
   }
 
   try {
-    // 5. Criar mensagem no banco primeiro
+    // Criar mensagem no banco primeiro
     const { data: savedMessage, error: msgError } = await supabase
       .from('messages')
       .insert({
@@ -901,7 +983,7 @@ export async function sendTemplateMessage(
       throw new Error(`Failed to save message: ${msgError?.message}`);
     }
 
-    // 6. Enviar via Twilio
+    // Enviar via Twilio SDK
     const messageOptions: any = {
       contentSid: template.twilio_content_sid,
       from,
@@ -915,7 +997,7 @@ export async function sendTemplateMessage(
 
     const twilioMessage = await client.messages.create(messageOptions);
 
-    // 7. Atualizar mensagem com SID
+    // Atualizar mensagem com SID
     await supabase
       .from('messages')
       .update({
@@ -941,17 +1023,14 @@ export async function deleteTemplateFromTwilio(
   organizationId: string,
   contentSid: string
 ): Promise<boolean> {
-  const twilioData = await getTwilioClient(organizationId);
-  if (!twilioData) {
+  const config = await getWhatsAppConfig(organizationId);
+  if (!config) {
     throw new Error('WhatsApp integration not configured');
   }
 
-  try {
-    await twilioData.client.content.v1.contents(contentSid).remove();
+  const deleted = await deleteTwilioContent(config, contentSid);
+  if (deleted) {
     console.log(`✅ Deleted from Twilio: ${contentSid}`);
-    return true;
-  } catch (error: any) {
-    console.error('❌ Error deleting from Twilio:', error);
-    return false;
   }
+  return deleted;
 }
