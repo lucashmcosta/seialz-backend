@@ -246,4 +246,76 @@ export async function twilioWebhookRoutes(app: FastifyInstance) {
 
     return reply.status(200).send('');
   });
+
+  // Webhook de status de Content Templates (aprovação WhatsApp)
+  // URL: /webhook/twilio/content-status
+  // Twilio envia quando o status de aprovação de um template muda
+  app.post('/webhook/twilio/content-status', async (request: FastifyRequest, reply: FastifyReply) => {
+    const body = request.body as {
+      ContentSid?: string;
+      ApprovalStatus?: string;
+      RejectionReason?: string;
+      // Campos alternativos que Twilio pode enviar
+      content_sid?: string;
+      approval_status?: string;
+      rejection_reason?: string;
+    };
+
+    // Normalizar campos (Twilio pode enviar em diferentes formatos)
+    const contentSid = body.ContentSid || body.content_sid;
+    const approvalStatus = body.ApprovalStatus || body.approval_status;
+    const rejectionReason = body.RejectionReason || body.rejection_reason;
+
+    if (!contentSid) {
+      console.error('❌ Missing ContentSid in content status webhook');
+      return reply.status(400).send('Missing ContentSid');
+    }
+
+    console.log(`📥 Template status update: ${contentSid} -> ${approvalStatus}`);
+
+    try {
+      // Buscar template pelo twilio_content_sid
+      const { data: template, error: findError } = await supabase
+        .from('whatsapp_templates')
+        .select('id, organization_id, friendly_name')
+        .eq('twilio_content_sid', contentSid)
+        .single();
+
+      if (findError || !template) {
+        console.warn(`⚠️ Template not found for ContentSid: ${contentSid}`);
+        // Retornar 200 mesmo assim para não causar retries do Twilio
+        return reply.status(200).send('Template not found');
+      }
+
+      // Mapear status do Twilio para nosso formato
+      let mappedStatus = approvalStatus?.toLowerCase() || 'pending';
+      if (mappedStatus === 'approved') mappedStatus = 'approved';
+      else if (mappedStatus === 'rejected') mappedStatus = 'rejected';
+      else if (mappedStatus === 'pending') mappedStatus = 'pending';
+
+      // Atualizar status no banco
+      const { error: updateError } = await supabase
+        .from('whatsapp_templates')
+        .update({
+          status: mappedStatus,
+          rejection_reason: rejectionReason || null,
+          last_synced_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', template.id);
+
+      if (updateError) {
+        console.error('❌ Error updating template status:', updateError);
+        return reply.status(500).send('Error updating status');
+      }
+
+      console.log(`✅ Template "${template.friendly_name}" status updated to: ${mappedStatus}`);
+
+      return reply.status(200).send('');
+
+    } catch (error) {
+      console.error('❌ Content status webhook error:', error);
+      return reply.status(500).send('Internal error');
+    }
+  });
 }

@@ -389,7 +389,7 @@ export async function createTemplate(
         header: data.header,
         footer: data.footer,
         variables: data.variables || [],
-        status: 'pending',
+        status: 'not_submitted',
         category: data.category,
         is_active: true,
       })
@@ -480,7 +480,7 @@ export async function updateTemplate(
         footer: mergedData.footer,
         variables: mergedData.variables || [],
         category: mergedData.category,
-        status: 'pending', // Reset status após edição
+        status: 'not_submitted', // Reset status após edição - precisa re-submeter para aprovação
         updated_at: new Date().toISOString(),
       })
       .eq('organization_id', organizationId)
