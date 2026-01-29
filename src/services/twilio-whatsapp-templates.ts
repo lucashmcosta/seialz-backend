@@ -35,6 +35,7 @@ export interface WhatsAppTemplate {
   rejection_reason?: string;
   category?: string;
   is_active: boolean;
+  source?: string; // 'user', 'twilio_sample', 'twilio_tryout'
   last_synced_at?: string;
   created_at: string;
   updated_at: string;
@@ -234,6 +235,49 @@ async function deleteTwilioContent(
 }
 
 // ===========================
+// HELPERS - TEMPLATE SOURCE DETECTION
+// ===========================
+
+/**
+ * Detecta a origem de um template baseado no nome
+ * Templates da Twilio (sample/tryout) não devem ser considerados "approved"
+ */
+function detectTemplateSource(friendlyName: string | undefined): 'user' | 'twilio_sample' | 'twilio_tryout' {
+  if (!friendlyName) return 'twilio_sample';
+
+  const name = friendlyName.toLowerCase();
+
+  // Templates de Tryout (sandbox da Twilio)
+  if (name.includes('tryout') || name.includes('try out')) {
+    return 'twilio_tryout';
+  }
+
+  // Templates de exemplo/sample da Twilio
+  if (
+    name.includes('sample') ||
+    name.includes('verification') ||
+    name.includes('verifications_') ||
+    name.includes('appointment_reminder') ||
+    name.includes('order_notification') ||
+    name.includes('shipping_update') ||
+    name.startsWith('hx') // Templates sem nome amigável (apenas o SID)
+  ) {
+    return 'twilio_sample';
+  }
+
+  // Se não bate com nenhum padrão, assume que é do usuário
+  return 'user';
+}
+
+/**
+ * Verifica se um template é de amostra/tryout (não deve ser usado em produção)
+ */
+function isSampleOrTryoutTemplate(friendlyName: string | undefined): boolean {
+  const source = detectTemplateSource(friendlyName);
+  return source === 'twilio_sample' || source === 'twilio_tryout';
+}
+
+// ===========================
 // HELPERS - PAYLOAD BUILDER
 // ===========================
 
@@ -331,6 +375,7 @@ function buildTwilioContentPayload(data: CreateTemplateInput): object {
 
 /**
  * Lista templates de uma organização
+ * @param filters.source - 'user' (default), 'twilio_sample', 'twilio_tryout', ou 'all'
  */
 export async function listTemplates(
   organizationId: string,
@@ -338,6 +383,7 @@ export async function listTemplates(
     status?: string;
     template_type?: string;
     is_active?: boolean;
+    source?: string;
   }
 ): Promise<WhatsAppTemplate[]> {
   let query = supabase
@@ -354,6 +400,12 @@ export async function listTemplates(
   }
   if (filters?.is_active !== undefined) {
     query = query.eq('is_active', filters.is_active);
+  }
+
+  // Filtrar por source (origem do template)
+  // 'all' = mostrar todos, caso contrário filtrar pelo valor específico
+  if (filters?.source && filters.source !== 'all') {
+    query = query.eq('source', filters.source);
   }
 
   const { data, error } = await query;
@@ -500,6 +552,7 @@ export async function createTemplate(
         variables: data.variables || [],
         status: 'not_submitted',
         category: data.category,
+        source: 'user', // Templates criados pelo usuário
         is_active: true,
       })
       .select()
@@ -881,12 +934,23 @@ export async function syncAllTemplates(organizationId: string): Promise<{
       else if (contentTypes?.['twilio/list-picker']) templateType = 'list-picker';
       else if (contentTypes?.['twilio/media']) templateType = 'media';
 
+      // Detectar origem do template (user, twilio_sample, twilio_tryout)
+      const templateSource = detectTemplateSource(content.friendly_name);
+
+      // Templates de sample/tryout NÃO devem ser marcados como "approved"
+      // mesmo que a Twilio retorne esse status (são templates de sandbox)
+      let finalStatus = approvalStatus;
+      if (templateSource !== 'user' && approvalStatus === 'approved') {
+        finalStatus = 'sample'; // Status especial para templates de amostra
+      }
+
       if (existing) {
         await supabase
           .from('whatsapp_templates')
           .update({
-            status: approvalStatus,
+            status: finalStatus,
             rejection_reason: rejectionReason,
+            source: templateSource,
             last_synced_at: new Date().toISOString(),
             updated_at: new Date().toISOString(),
           })
@@ -902,8 +966,9 @@ export async function syncAllTemplates(organizationId: string): Promise<{
             language: content.language || 'pt_BR',
             template_type: templateType,
             body: body,
-            status: approvalStatus,
+            status: finalStatus,
             rejection_reason: rejectionReason,
+            source: templateSource,
             is_active: true,
             last_synced_at: new Date().toISOString(),
           });
