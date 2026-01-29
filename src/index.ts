@@ -90,6 +90,7 @@ const start = async () => {
 ║   Webhooks:                                               ║
 ║   - Twilio: POST /webhook/twilio/whatsapp                 ║
 ║   - Status: POST /webhook/twilio/status                   ║
+║   - Content: POST /webhook/twilio/content-status          ║
 ║                                                           ║
 ║   API:                                                    ║
 ║   - Templates: /api/whatsapp/templates                    ║
