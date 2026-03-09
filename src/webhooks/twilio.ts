@@ -14,6 +14,13 @@ interface TwilioWebhookBody {
   MediaUrl0?: string;
   MediaContentType0?: string;
   ProfileName?: string;
+  // Click-to-WhatsApp Ad referral fields (flat params from Twilio)
+  ReferralBody?: string;
+  ReferralHeadline?: string;
+  ReferralSourceId?: string;
+  ReferralSourceType?: string;
+  ReferralSourceUrl?: string;
+  ReferralMediaUrl?: string;
 }
 
 interface WhatsAppConfig {
@@ -102,6 +109,41 @@ export async function twilioWebhookRoutes(app: FastifyInstance) {
         }
 
         contactId = newContact.id;
+      }
+
+      // 4b. Capturar dados de referral (Click-to-WhatsApp Ads)
+      if (body.ReferralSourceUrl || body.ReferralHeadline || body.ReferralBody || body.ReferralSourceId) {
+        console.log(`📢 Referral detected for contact ${contactId} (source: ${body.ReferralSourceType || 'unknown'})`);
+
+        // Só gravar se o contato ainda não tem referral (primeira mensagem do ad)
+        const { data: contactReferral } = await supabase
+          .from('contacts')
+          .select('ad_referral_captured_at')
+          .eq('id', contactId)
+          .single();
+
+        if (!contactReferral?.ad_referral_captured_at) {
+          const { error: referralError } = await supabase
+            .from('contacts')
+            .update({
+              ad_referral_source_url: body.ReferralSourceUrl || null,
+              ad_referral_headline: body.ReferralHeadline || null,
+              ad_referral_body: body.ReferralBody || null,
+              ad_referral_media_url: body.ReferralMediaUrl || null,
+              ad_referral_source_id: body.ReferralSourceId || null,
+              ad_referral_source_type: body.ReferralSourceType || null,
+              ad_referral_captured_at: new Date().toISOString(),
+            })
+            .eq('id', contactId);
+
+          if (referralError) {
+            console.error('❌ Error saving referral data:', referralError);
+          } else {
+            console.log(`✅ Referral data saved for contact ${contactId}`);
+          }
+        } else {
+          console.log(`ℹ️ Contact ${contactId} already has referral data, skipping`);
+        }
       }
 
       // 5. Encontrar ou criar thread
