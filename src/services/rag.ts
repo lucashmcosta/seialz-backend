@@ -384,7 +384,7 @@ export function detectProductInMessage(
  * 3. Se nenhum produto detectado, busca em TUDO
  * 4. Merge e deduplica resultados
  */
-async function searchKnowledgeHybrid(
+export async function searchKnowledgeHybrid(
   embedding: number[],
   organizationId: string,
   productIds: string[]
