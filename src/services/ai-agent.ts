@@ -1,7 +1,14 @@
-import Anthropic from '@anthropic-ai/sdk';
 import { supabase } from '../lib/supabase.js';
+import type { AIProvider } from '../lib/supabase.js';
 import { sendWhatsAppMessage } from './whatsapp.js';
-import { getRelevantContext, formatRAGContext } from './rag.js';
+import { getRelevantContext, formatRAGContext, generateEmbedding, getOrganizationProducts, detectAllProductsInMessage, extractSearchContext, searchKnowledgeHybrid, rerankResults } from './rag.js';
+import { guardInput } from '../guards/input-guard.js';
+import { guardOutput } from '../guards/output-guard.js';
+import { createGuardClient } from '../guards/llm-client.js';
+import { createGenerationClient, type GenTool, type GenMessage, type GenContentBlock } from '../guards/generation-client.js';
+import { logInteraction } from '../logging/interaction-logger.js';
+import { getGuardModel } from '../guards/constants.js';
+import type { OutputGuardResult, RAGChunkForGuard } from '../guards/types.js';
 
 interface ProcessMessageOptions {
   threadId: string;
@@ -29,7 +36,7 @@ interface ContactMemories {
 }
 
 // Available tools for the agent
-const AVAILABLE_TOOLS: Anthropic.Tool[] = [
+const AVAILABLE_TOOLS: GenTool[] = [
   {
     name: "update_contact",
     description: `Atualiza informacoes do contato no CRM.
@@ -336,23 +343,13 @@ export async function processAIMessage(options: ProcessMessageOptions) {
   }
 
   try {
-    // 1. Buscar configuracoes do agente, integracao Claude, memorias e contato
-    const [agentResult, claudeIntegrationResult, memoriesResult, contactResult] = await Promise.all([
+    // 1. Buscar configuracoes do agente, memorias e contato
+    const [agentResult, memoriesResult, contactResult] = await Promise.all([
       supabase
         .from('ai_agents')
         .select('*')
         .eq('id', agentId)
         .eq('organization_id', organizationId)
-        .single(),
-      supabase
-        .from('organization_integrations')
-        .select(`
-          config_values,
-          admin_integrations!inner(slug)
-        `)
-        .eq('organization_id', organizationId)
-        .eq('admin_integrations.slug', 'claude-ai')
-        .eq('is_enabled', true)
         .single(),
       supabase
         .from('contact_memories')
@@ -371,17 +368,25 @@ export async function processAIMessage(options: ProcessMessageOptions) {
     }
 
     const agent = agentResult.data;
-    const claudeIntegration = claudeIntegrationResult.data;
     const memories = memoriesResult.data as ContactMemories | null;
     const contact = contactResult.data;
 
-    // 2. API key
-    const anthropicKey = (claudeIntegration?.config_values as any)?.api_key || process.env.ANTHROPIC_API_KEY;
-    if (!anthropicKey) {
-      throw new Error('Anthropic API key not configured');
+    // 2. Provider, model & API key — from the agent config (multi-tenant)
+    const agentProvider: AIProvider = agent.provider || 'anthropic';
+    const agentModel: string = agent.model || 'claude-sonnet-4-6';
+    const apiKey: string = agent.api_key || '';
+    if (!apiKey) {
+      throw new Error(`API key not configured for agent (provider: ${agentProvider})`);
     }
 
-    const anthropic = new Anthropic({ apiKey: anthropicKey });
+    // Guard model: cheapest of the same provider
+    const guardModel = getGuardModel(agentProvider);
+
+    // Main generation client (provider-agnostic — supports tool use)
+    const genClient = createGenerationClient(agentProvider, apiKey);
+
+    // Guard client (provider-agnostic — cheapest model of same provider)
+    const guardClient = createGuardClient(agentProvider, apiKey);
 
     // 3. Buscar historico
     const { data: history } = await supabase
@@ -393,8 +398,8 @@ export async function processAIMessage(options: ProcessMessageOptions) {
       .order('created_at', { ascending: true })
       .limit(20);
 
-    // 4. Montar mensagens
-    const messages: Anthropic.MessageParam[] = (history || [])
+    // 4. Montar mensagens (provider-agnostic)
+    const messages: GenMessage[] = (history || [])
       .filter(m => m.content && m.content.trim() !== '')
       .map(m => ({
         role: m.direction === 'inbound' ? 'user' as const : 'assistant' as const,
@@ -418,19 +423,160 @@ export async function processAIMessage(options: ProcessMessageOptions) {
     // 5. Construir instrucao de nome
     const nameInstruction = buildNameInstruction(contact?.full_name, memories);
 
-    // 6. Buscar contexto RAG (base de conhecimento)
-    console.log('🔍 Fetching RAG context...');
+    // === GUARDRAIL LAYER 1: INPUT GUARD + RAG PREP IN PARALLEL ===
     const messageHistoryForRAG = (history || []).map(m => ({
       content: m.content,
       direction: m.direction,
     }));
-    const ragContexts = await getRelevantContext(message, organizationId, messageHistoryForRAG);
-    const ragSection = formatRAGContext(ragContexts);
+    const guardHistory = (history || [])
+      .filter(m => m.content && m.content.trim() !== '')
+      .slice(-6)
+      .map(m => ({
+        role: m.direction === 'inbound' ? 'user' : 'assistant',
+        content: m.content,
+      }));
 
-    if (ragContexts.length > 0) {
-      console.log(`📚 RAG: ${ragContexts.length} knowledge chunks injected`);
+    console.log('🛡️ Running input guard + RAG embedding in parallel...');
+    const ragEmbeddingStart = Date.now();
+
+    // Parallelism: input guard + embedding computation
+    const searchContext = extractSearchContext(message, messageHistoryForRAG);
+    const [inputGuardOutput, embedding, products] = await Promise.all([
+      guardInput(message, guardHistory, guardClient, guardModel),
+      generateEmbedding(searchContext),
+      getOrganizationProducts(organizationId),
+    ]);
+
+    const { result: inputGuardResult, latencyMs: inputGuardLatencyMs } = inputGuardOutput;
+    let totalGuardInputTokens = inputGuardOutput.guardInputTokens;
+    let totalGuardOutputTokens = inputGuardOutput.guardOutputTokens;
+
+    console.log(`🛡️ Input guard: action=${inputGuardResult.action} intent=${inputGuardResult.intent} confidence=${inputGuardResult.confidence} (${inputGuardLatencyMs}ms)`);
+
+    // Metrics tracking
+    let ragLatencyMs = 0;
+    let generationLatencyMs = 0;
+    let outputGuardLatencyMs = 0;
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let ragChunksForLog: Array<{ chunk_id?: string; title?: string; score?: number; rerank_score?: number }> = [];
+    let ragProductsDetected: string[] = [];
+    let rawResponse = '';
+    let outputGuardResult: OutputGuardResult | null = null;
+    let wasRewritten = false;
+
+    // --- Handle block ---
+    if (inputGuardResult.action === 'block') {
+      console.log('🚫 Message blocked by input guard (prompt injection detected)');
+      const blockedResponse = 'Desculpe, nao consegui entender sua mensagem. Pode reformular?';
+
+      await sendWhatsAppMessage({ threadId, organizationId, content: blockedResponse });
+
+      // Log and return
+      logInteraction({
+        organization_id: organizationId, contact_id: contactId, thread_id: threadId,
+        user_message: message,
+        input_guard_result: inputGuardResult,
+        detected_intent: inputGuardResult.intent,
+        provider: agentProvider, generation_model: agentModel, guard_model: guardModel,
+        final_response: blockedResponse,
+        guard_input_tokens: totalGuardInputTokens, guard_output_tokens: totalGuardOutputTokens,
+        input_guard_latency_ms: inputGuardLatencyMs,
+        total_latency_ms: Date.now() - ragEmbeddingStart,
+      }).catch(() => {});
+
+      return { success: true, response: blockedResponse, toolsExecuted: [] };
+    }
+
+    // --- Handle escalate (from input guard) ---
+    if (inputGuardResult.action === 'escalate') {
+      console.log('🚨 Escalating to human (input guard)');
+      await executeTool('transfer_to_human', { reason: `Input guard escalation: ${inputGuardResult.reasoning}` }, { contactId, organizationId, threadId });
+      const escalateResponse = 'Entendo sua preocupacao. Vou transferir voce para um de nossos atendentes que podera ajudar melhor. Um momento, por favor.';
+
+      await sendWhatsAppMessage({ threadId, organizationId, content: escalateResponse });
+
+      logInteraction({
+        organization_id: organizationId, contact_id: contactId, thread_id: threadId,
+        user_message: message,
+        input_guard_result: inputGuardResult,
+        detected_intent: inputGuardResult.intent,
+        provider: agentProvider, generation_model: agentModel, guard_model: guardModel,
+        final_response: escalateResponse,
+        tools_used: ['transfer_to_human'],
+        guard_input_tokens: totalGuardInputTokens, guard_output_tokens: totalGuardOutputTokens,
+        input_guard_latency_ms: inputGuardLatencyMs,
+        total_latency_ms: Date.now() - ragEmbeddingStart,
+      }).catch(() => {});
+
+      return { success: true, response: escalateResponse, toolsExecuted: ['transfer_to_human'] };
+    }
+
+    // --- RAG (skip or proceed) ---
+    let ragContexts: Awaited<ReturnType<typeof getRelevantContext>> = [];
+    let ragSection = '';
+
+    if (inputGuardResult.action === 'skip_rag') {
+      console.log(`⏭️ Skipping RAG (intent: ${inputGuardResult.intent})`);
+      ragLatencyMs = 0;
     } else {
-      console.log('⚠️ RAG: No relevant knowledge found');
+      // action === 'proceed' — run RAG using the pre-computed embedding
+      console.log('🔍 Running RAG with pre-computed embedding...');
+      const ragStart = Date.now();
+
+      if (embedding) {
+        // Detect products
+        const detectedProductIds = detectAllProductsInMessage(message, products);
+        ragProductsDetected = detectedProductIds.map(id => {
+          const p = products.find(prod => prod.id === id);
+          return p?.name || id;
+        });
+
+        // If no product in current message, check recent history
+        let finalProductIds = detectedProductIds;
+        if (finalProductIds.length === 0 && messageHistoryForRAG.length > 0) {
+          const recentMessages = messageHistoryForRAG.slice(-5).reverse();
+          for (const msg of recentMessages) {
+            if (msg.content) {
+              const detected = detectAllProductsInMessage(msg.content, products);
+              if (detected.length > 0) {
+                finalProductIds = detected;
+                break;
+              }
+            }
+          }
+        }
+
+        const { candidates, sourceStats } = await searchKnowledgeHybrid(embedding, organizationId, finalProductIds);
+
+        if (candidates.length > 0) {
+          const documents = candidates.map(c => c.content);
+          const rerankedIndices = await rerankResults(searchContext, documents, 5);
+
+          ragContexts = rerankedIndices
+            .map(idx => candidates[idx])
+            .filter(Boolean)
+            .map(chunk => ({
+              content: chunk.content,
+              title: chunk.title,
+              scope: (chunk.scope || 'global') as 'product' | 'global',
+              category: chunk.category || 'geral',
+            }));
+
+          ragChunksForLog = ragContexts.map((c, i) => ({
+            title: c.title,
+            score: candidates[rerankedIndices[i]]?.similarity,
+          }));
+        }
+
+        console.log(`📚 RAG: ${ragContexts.length} knowledge chunks injected`);
+      } else {
+        console.log('⚠️ RAG: Embedding failed, falling back to getRelevantContext');
+        ragContexts = await getRelevantContext(message, organizationId, messageHistoryForRAG);
+      }
+
+      ragSection = formatRAGContext(ragContexts);
+      ragLatencyMs = Date.now() - ragStart;
     }
 
     // 7. System prompt
@@ -455,30 +601,34 @@ NUNCA use tags [BUTTONS], [OPTIONS] ou similares
 NUNCA formate opcoes como lista numerada (1. 2. 3.)
 Responda de forma natural e fluida`;
 
-    // 8. Chamar Claude
-    let response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1024,
+    // 8. Chamar LLM (provider-agnostic)
+    const generationStart = Date.now();
+    let response = await genClient.generate({
+      model: agentModel,
+      maxTokens: 1024,
       system: systemPrompt,
       messages: validMessages,
       tools: AVAILABLE_TOOLS,
     });
 
-    // 9. Processar tool calls
+    inputTokens += response.inputTokens;
+    outputTokens += response.outputTokens;
+
+    // 9. Processar tool calls (provider-agnostic loop)
     const toolsExecuted: string[] = [];
-    let currentMessages = [...validMessages];
+    let currentMessages: GenMessage[] = [...validMessages];
     let maxIterations = 5;
     let iterations = 0;
 
-    while (response.stop_reason === 'tool_use' && iterations < maxIterations) {
+    while (response.stopReason === 'tool_use' && iterations < maxIterations) {
       iterations++;
       console.log(`🔄 Tool iteration ${iterations}/${maxIterations}`);
 
       const toolUseBlocks = response.content.filter(
-        (block): block is Anthropic.ToolUseBlock => block.type === 'tool_use'
+        (block): block is GenContentBlock & { type: 'tool_use' } => block.type === 'tool_use'
       );
 
-      const toolResults: Anthropic.ToolResultBlockParam[] = [];
+      const toolResults: GenContentBlock[] = [];
 
       for (const toolUse of toolUseBlocks) {
         console.log(`🔧 Tool call: ${toolUse.name}`);
@@ -500,18 +650,21 @@ Responda de forma natural e fluida`;
       currentMessages.push({ role: 'assistant', content: response.content });
       currentMessages.push({ role: 'user', content: toolResults });
 
-      response = await anthropic.messages.create({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1024,
+      response = await genClient.generate({
+        model: agentModel,
+        maxTokens: 1024,
         system: systemPrompt,
         messages: currentMessages,
         tools: AVAILABLE_TOOLS,
       });
+
+      inputTokens += response.inputTokens;
+      outputTokens += response.outputTokens;
     }
 
     // 10. Extrair resposta
     const textBlock = response.content.find(
-      (block): block is Anthropic.TextBlock => block.type === 'text'
+      (block): block is GenContentBlock & { type: 'text' } => block.type === 'text'
     );
 
     let aiResponse = textBlock?.text || '';
@@ -525,15 +678,18 @@ Responda de forma natural e fluida`;
         content: 'As ferramentas foram executadas. Agora responda ao cliente de forma natural.',
       });
 
-      const retryResponse = await anthropic.messages.create({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1024,
+      const retryResponse = await genClient.generate({
+        model: agentModel,
+        maxTokens: 1024,
         system: systemPrompt,
         messages: currentMessages,
       });
 
+      inputTokens += retryResponse.inputTokens;
+      outputTokens += retryResponse.outputTokens;
+
       const retryTextBlock = retryResponse.content.find(
-        (block): block is Anthropic.TextBlock => block.type === 'text'
+        (block): block is GenContentBlock & { type: 'text' } => block.type === 'text'
       );
       aiResponse = retryTextBlock?.text || '';
     }
@@ -542,17 +698,85 @@ Responda de forma natural e fluida`;
       aiResponse = 'Desculpe, nao consegui processar sua mensagem. Pode repetir?';
     }
 
+    rawResponse = aiResponse;
+    generationLatencyMs = Date.now() - generationStart;
+
     console.log(`✅ AI response: "${aiResponse.substring(0, 100)}..."`);
     console.log(`   Tools: ${toolsExecuted.join(', ') || 'none'}`);
+
+    // === GUARDRAIL LAYER 2: OUTPUT GUARD ===
+    let finalResponse = aiResponse;
+
+    if (ragContexts.length > 0) {
+      console.log('🛡️ Running output guard...');
+      const ragChunksForGuard: RAGChunkForGuard[] = ragContexts.map(c => ({
+        title: c.title,
+        content: c.content,
+      }));
+
+      const outputGuardOutput = await guardOutput(aiResponse, ragChunksForGuard, message, guardClient, guardModel);
+      outputGuardResult = outputGuardOutput.result;
+      outputGuardLatencyMs = outputGuardOutput.latencyMs;
+      totalGuardInputTokens += outputGuardOutput.guardInputTokens;
+      totalGuardOutputTokens += outputGuardOutput.guardOutputTokens;
+
+      console.log(`🛡️ Output guard: action=${outputGuardResult.action} grounded=${outputGuardResult.groundedClaims.length} ungrounded=${outputGuardResult.ungroundedClaims.length} (${outputGuardLatencyMs}ms)`);
+
+      if (outputGuardResult.action === 'rewrite' && outputGuardResult.rewrittenResponse) {
+        console.log('✏️ Response rewritten by output guard');
+        finalResponse = outputGuardResult.rewrittenResponse;
+        wasRewritten = true;
+      } else if (outputGuardResult.action === 'escalate') {
+        console.log('🚨 Escalating to human (output guard — too many ungrounded claims)');
+        await executeTool('transfer_to_human', { reason: 'Output guard escalation: majority of claims ungrounded' }, { contactId, organizationId, threadId });
+        finalResponse = 'Vou verificar essas informacoes com nossa equipe para te dar uma resposta precisa. Um momento, por favor.';
+        toolsExecuted.push('transfer_to_human');
+        wasRewritten = true;
+      }
+    } else {
+      console.log('⏭️ Skipping output guard (no RAG chunks to verify against)');
+    }
 
     // 11. Enviar resposta
     await sendWhatsAppMessage({
       threadId,
       organizationId,
-      content: aiResponse,
+      content: finalResponse,
     });
 
-    return { success: true, response: aiResponse, toolsExecuted };
+    // === GUARDRAIL LAYER 3: LOGGING (fire-and-forget) ===
+    const totalLatencyMs = Date.now() - ragEmbeddingStart;
+    logInteraction({
+      organization_id: organizationId,
+      contact_id: contactId,
+      thread_id: threadId,
+      user_message: message,
+      input_guard_result: inputGuardResult,
+      detected_intent: inputGuardResult.intent,
+      rag_chunks_used: ragChunksForLog.length > 0 ? ragChunksForLog : null,
+      rag_query: ragContexts.length > 0 ? searchContext : null,
+      rag_products_detected: ragProductsDetected.length > 0 ? ragProductsDetected : null,
+      provider: agentProvider,
+      generation_model: agentModel,
+      guard_model: guardModel,
+      raw_response: rawResponse,
+      tools_used: toolsExecuted.length > 0 ? toolsExecuted : null,
+      tool_iterations: iterations > 0 ? iterations : null,
+      output_guard_result: outputGuardResult,
+      final_response: finalResponse,
+      was_rewritten: wasRewritten,
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      guard_input_tokens: totalGuardInputTokens,
+      guard_output_tokens: totalGuardOutputTokens,
+      total_latency_ms: totalLatencyMs,
+      rag_latency_ms: ragLatencyMs,
+      input_guard_latency_ms: inputGuardLatencyMs,
+      output_guard_latency_ms: outputGuardLatencyMs,
+      generation_latency_ms: generationLatencyMs,
+    }, systemPrompt).catch(() => {});
+
+    return { success: true, response: finalResponse, toolsExecuted };
 
   } catch (error) {
     console.error('❌ AI processing error:', error);

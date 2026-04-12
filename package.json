@@ -10,18 +10,25 @@
     "start": "node dist/index.js",
     "inngest-dev": "npx inngest-cli@latest dev"
   },
-  "keywords": ["crm", "whatsapp", "ai", "chatbot"],
+  "keywords": [
+    "crm",
+    "whatsapp",
+    "ai",
+    "chatbot"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.1",
-    "@supabase/supabase-js": "^2.47.10",
-    "fastify": "^5.1.0",
     "@fastify/cors": "^10.0.1",
     "@fastify/formbody": "^8.0.1",
+    "@google/generative-ai": "^0.24.1",
+    "@supabase/supabase-js": "^2.47.10",
+    "dotenv": "^16.4.7",
+    "fastify": "^5.1.0",
     "inngest": "^3.27.0",
-    "twilio": "^5.4.0",
-    "dotenv": "^16.4.7"
+    "openai": "^6.34.0",
+    "twilio": "^5.4.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

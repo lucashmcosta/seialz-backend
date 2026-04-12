@@ -92,10 +92,15 @@ export interface Organization {
   openai_api_key?: string;
 }
 
+export type AIProvider = 'anthropic' | 'openai' | 'google';
+
 export interface AIAgent {
   id: string;
   organization_id: string;
   name: string;
   is_enabled: boolean;
   system_prompt?: string;
+  provider: AIProvider;
+  model: string;
+  api_key?: string;
 }
