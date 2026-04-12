@@ -132,6 +132,15 @@ export async function guardInput(
         throw new Error(`Invalid guard response: ${response.text.substring(0, 100)}`);
       }
 
+      // Enforce intent→action mapping (LLM sometimes returns wrong action for intent)
+      const SKIP_RAG_INTENTS = ['greeting', 'farewell', 'acknowledgment', 'name_response'];
+      if (SKIP_RAG_INTENTS.includes(parsed.intent) && parsed.action === 'proceed') {
+        parsed.action = 'skip_rag';
+      }
+      if (parsed.intent === 'prompt_injection' && parsed.action !== 'block') {
+        parsed.action = 'block';
+      }
+
       return {
         result: parsed,
         latencyMs: Date.now() - start,

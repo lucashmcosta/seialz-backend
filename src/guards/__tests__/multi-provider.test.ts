@@ -174,12 +174,12 @@ describe('Multi-Provider: JSON parsing handles provider quirks', () => {
     const client: GuardLLMClient = {
       provider: 'openai',
       complete: mock.fn(async () => ({
-        text: '{"action":"proceed","intent":"greeting","confidence":0.9,"reasoning":"ola"}',
+        text: '{"action":"proceed","intent":"product_question","confidence":0.9,"reasoning":"pergunta sobre produto"}',
         inputTokens: 50, outputTokens: 20,
       })),
     };
 
-    const { result } = await guardInput('Ola!', [], client, 'gpt-4o-mini');
+    const { result } = await guardInput('Quanto custa o visto?', [], client, 'gpt-4o-mini');
     assert.equal(result.action, 'proceed');
   });
 

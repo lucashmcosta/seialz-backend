@@ -532,10 +532,10 @@ export async function processAIMessage(options: ProcessMessageOptions) {
           return p?.name || id;
         });
 
-        // If no product in current message, check recent history
+        // If no product in current message, check recent history (last 10 msgs, both directions)
         let finalProductIds = detectedProductIds;
         if (finalProductIds.length === 0 && messageHistoryForRAG.length > 0) {
-          const recentMessages = messageHistoryForRAG.slice(-5).reverse();
+          const recentMessages = messageHistoryForRAG.slice(-10).reverse();
           for (const msg of recentMessages) {
             if (msg.content) {
               const detected = detectAllProductsInMessage(msg.content, products);
@@ -580,7 +580,7 @@ export async function processAIMessage(options: ProcessMessageOptions) {
     }
 
     // 7. System prompt
-    const systemPrompt = `${agent.system_prompt || 'Voce e um assistente prestativo.'}
+    const systemPrompt = `${agent.custom_instructions || agent.system_prompt || 'Voce e um assistente prestativo.'}
 ${ragSection}
 
 ## CONTEXTO DO CONTATO
@@ -593,13 +593,23 @@ ${nameInstruction}
 
 ## TOM DE COMUNICACAO
 - Seja informal e natural, como uma conversa no WhatsApp
-- Nao use emojis excessivos
-- Frases curtas e diretas
+- NAO use emojis (exceto se o cliente usar primeiro)
+- NAO use markdown (sem **negrito**, sem *italico*, sem listas com -)
+- Frases curtas e diretas, texto puro
+- Maximo 2 paragrafos curtos por mensagem
 
-## REGRAS IMPORTANTES
+## REGRA CRITICA: MANTENHA O CONTEXTO
+- Leia TODAS as mensagens anteriores da conversa
+- Se o cliente ja disse qual produto quer, NAO pergunte de novo
+- Se o cliente ja informou algo, NAO peca a mesma informacao
+- Se o cliente reclamar que ja falou algo, peca desculpa e use a informacao que ele ja deu
+- Quando o cliente disser "quero fechar" ou "quero pagar", avance direto para o fechamento
+
+## REGRAS DE FORMATACAO
 NUNCA use tags [BUTTONS], [OPTIONS] ou similares
 NUNCA formate opcoes como lista numerada (1. 2. 3.)
-Responda de forma natural e fluida`;
+NUNCA use markdown (**, *, -, #, etc) — WhatsApp nao renderiza
+Responda de forma natural e fluida, texto corrido`;
 
     // 8. Chamar LLM (provider-agnostic)
     const generationStart = Date.now();
