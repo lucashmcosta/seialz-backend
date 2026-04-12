@@ -516,7 +516,13 @@ export async function processAIMessage(options: ProcessMessageOptions) {
     let ragContexts: Awaited<ReturnType<typeof getRelevantContext>> = [];
     let ragSection = '';
 
-    if (inputGuardResult.action === 'skip_rag') {
+    // Acknowledgments in active conversations should NOT skip RAG —
+    // the model needs product context to continue (e.g., "quero" after a price quote).
+    // Only pure greetings/farewells/name responses truly skip RAG.
+    const skipRag = inputGuardResult.action === 'skip_rag'
+      && inputGuardResult.intent !== 'acknowledgment';
+
+    if (skipRag) {
       console.log(`⏭️ Skipping RAG (intent: ${inputGuardResult.intent})`);
       ragLatencyMs = 0;
     } else {
@@ -553,7 +559,14 @@ export async function processAIMessage(options: ProcessMessageOptions) {
           const documents = candidates.map(c => c.content);
           const rerankedIndices = await rerankResults(searchContext, documents, 5);
 
-          ragContexts = rerankedIndices
+          // Filter out low-relevance chunks (score < 0.30) to avoid polluting prompt
+          const MIN_CHUNK_SCORE = 0.30;
+          const filteredIndices = rerankedIndices.filter(idx => {
+            const score = candidates[idx]?.similarity ?? 0;
+            return score >= MIN_CHUNK_SCORE;
+          });
+
+          ragContexts = filteredIndices
             .map(idx => candidates[idx])
             .filter(Boolean)
             .map(chunk => ({
@@ -565,8 +578,12 @@ export async function processAIMessage(options: ProcessMessageOptions) {
 
           ragChunksForLog = ragContexts.map((c, i) => ({
             title: c.title,
-            score: candidates[rerankedIndices[i]]?.similarity,
+            score: candidates[filteredIndices[i]]?.similarity,
           }));
+
+          if (filteredIndices.length < rerankedIndices.length) {
+            console.log(`📚 RAG: filtered ${rerankedIndices.length - filteredIndices.length} low-score chunks (< ${MIN_CHUNK_SCORE})`);
+          }
         }
 
         console.log(`📚 RAG: ${ragContexts.length} knowledge chunks injected`);
